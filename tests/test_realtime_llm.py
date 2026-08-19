@@ -26,6 +26,7 @@ from pipecat.processors.aggregators.llm_context import NOT_GIVEN as LLM_CONTEXT_
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.frame_processor import FrameDirection
+from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pipecat.services.openai.realtime import events
 from pipecat.tests.utils import run_test
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
@@ -484,6 +485,28 @@ async def test_audio_transcription_completed_is_forwarded_once():
 
 
 @pytest.mark.asyncio
+async def test_audio_transcript_length_event_is_forwarded_as_rtvi_server_message():
+    service = CapturingBosonRealtimeLLMService()
+    event = {
+        "event_id": "event_1",
+        "type": "response.output_audio_transcript.length",
+        "response_id": "response_1",
+        "item_id": "item_1",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "Hello",
+        "length_ms": 320,
+    }
+
+    should_continue = await service._dispatch_boson_server_event(event)
+
+    assert should_continue is True
+    server_messages = [frame for frame in service.pushed if isinstance(frame, RTVIServerMessageFrame)]
+    assert len(server_messages) == 1
+    assert server_messages[0].data == event
+
+
+@pytest.mark.asyncio
 async def test_completed_transcription_dedup_cache_is_bounded():
     service = CapturingBosonRealtimeLLMService()
 
@@ -753,6 +776,14 @@ async def test_cancelled_response_created_after_cancel_filters_late_deltas():
     await service._handle_evt_text_delta(SimpleNamespace(response_id="resp_cancelled", delta="old text"))
     await service._handle_evt_audio_transcript_delta(
         SimpleNamespace(response_id="resp_cancelled", delta="old transcript")
+    )
+    await service._handle_evt_audio_transcript_length(
+        SimpleNamespace(
+            type="response.output_audio_transcript.length",
+            response_id="resp_cancelled",
+            delta="old transcript",
+            length_ms=320,
+        )
     )
     await service._handle_evt_audio_delta(
         SimpleNamespace(

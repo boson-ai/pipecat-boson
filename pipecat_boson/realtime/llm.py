@@ -31,6 +31,7 @@ from pipecat.processors.aggregators.llm_context import (
     is_given as is_context_value_given,
 )
 from pipecat.processors.frame_processor import FrameDirection
+from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pipecat.services.openai.realtime import events
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.services.settings import assert_given, is_given
@@ -86,6 +87,7 @@ _BOSON_SERVER_EVENT_HANDLERS = {
     "conversation.item.retrieved": "_handle_conversation_item_retrieved",
     "response.output_text.delta": "_handle_evt_text_delta",
     "response.output_audio_transcript.delta": "_handle_evt_audio_transcript_delta",
+    "response.output_audio_transcript.length": "_handle_evt_audio_transcript_length",
     "response.function_call_arguments.done": "_handle_evt_function_call_arguments_done",
     "response.created": "_handle_evt_response_created",
     "response.done": "_handle_evt_response_done",
@@ -104,7 +106,6 @@ _BOSON_IGNORED_SERVER_EVENT_TYPES = {
     "response.function_call_arguments.delta",
     "response.output_text.done",
     "response.output_audio.done",
-    "response.output_audio_transcript.length",
     "response.output_audio_transcript.done",
     "rate_limits.updated",
     "latency_testing",
@@ -768,6 +769,11 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             return
         await super()._handle_evt_audio_transcript_delta(evt)
 
+    async def _handle_evt_audio_transcript_length(self, evt) -> None:
+        if self._is_stale_response_event(evt):
+            return
+        await self.push_frame(RTVIServerMessageFrame(data=_to_plain_data(evt)))
+
     async def _handle_evt_response_done(self, evt):
         response = evt.response
         response_id = getattr(response, "id", None)
@@ -937,6 +943,14 @@ def _to_attr(value: Any) -> Any:
         return SimpleNamespace(**{key: _to_attr(item) for key, item in value.items()})
     if isinstance(value, list):
         return [_to_attr(item) for item in value]
+    return value
+
+
+def _to_plain_data(value: Any) -> Any:
+    if isinstance(value, SimpleNamespace):
+        return {key: _to_plain_data(item) for key, item in vars(value).items()}
+    if isinstance(value, list):
+        return [_to_plain_data(item) for item in value]
     return value
 
 

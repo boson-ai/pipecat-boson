@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Forward `response.output_audio_transcript.length` events to RTVI clients as server messages.
+
 ### Fixed
 
 - Omit `temperature` from realtime session updates unless callers configure it explicitly, allowing the server's default to apply.
