@@ -33,7 +33,7 @@ from pipecat.processors.aggregators.llm_context import (
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.openai.realtime import events
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
-from pipecat.services.settings import assert_given, is_given
+from pipecat.utils.types import assert_given, is_given
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
