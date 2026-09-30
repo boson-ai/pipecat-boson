@@ -2,16 +2,21 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import dataclasses
 import inspect
 import json
+import warnings
 from types import SimpleNamespace
 
 import pytest
 from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.clocks.system_clock import SystemClock
 from pipecat.frames.frames import (
     Frame,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
+    InputAudioRawFrame,
     InterruptionFrame,
     LLMConfigureOutputFrame,
     LLMContextFrame,
@@ -20,19 +25,22 @@ from pipecat.frames.frames import (
     LLMMessagesAppendFrame,
     LLMSetToolsFrame,
     LLMTextFrame,
+    StartFrame,
     TranscriptionFrame,
     UserStartedSpeakingFrame,
 )
 from pipecat.processors.aggregators.llm_context import NOT_GIVEN as LLM_CONTEXT_NOT_GIVEN
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-from pipecat.processors.frame_processor import FrameDirection
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
 from pipecat.services.openai.realtime import events
 from pipecat.tests.utils import run_test
+from pipecat.utils.asyncio.task_manager import TaskManager
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 import pipecat_boson.realtime.llm as realtime_llm
 from pipecat_boson.realtime import BosonRealtimeLLMService
+from pipecat_boson.realtime.config import SAMPLE_RATE
 
 
 # pipecat-ai >= 1.8.0 gives run_test() a 1-second default budget for the pipeline
@@ -1211,3 +1219,242 @@ async def test_session_created_event_notifies_application_handler():
 
     assert should_continue is True
     assert received_session_ids == ["24198f53"]
+
+
+@pytest.mark.asyncio
+async def test_session_update_declares_the_pipeline_input_sample_rate():
+    service = CapturingBosonRealtimeLLMService()
+    service._set_boson_input_sample_rate(16000)
+
+    await service._send_session_update()
+
+    audio = service.sent[-1]["session"]["audio"]
+    assert audio["input"]["format"] == {"type": "audio/pcm", "rate": 16000}
+    assert audio["output"]["format"]["rate"] == SAMPLE_RATE
+
+
+@pytest.mark.asyncio
+async def test_user_audio_is_sent_unchanged_when_it_matches_the_declared_rate():
+    service = CapturingBosonRealtimeLLMService()
+    service._set_boson_input_sample_rate(16000)
+    audio = b"\x00\x01" * 1600  # 100 ms at 16 kHz mono PCM16
+
+    await service._send_user_audio(InputAudioRawFrame(audio=audio, sample_rate=16000, num_channels=1))
+
+    payload = service.sent[-1]
+    assert payload["type"] == "input_audio_buffer.append"
+    assert base64.b64decode(payload["audio"]) == audio
+    assert service._boson_input_resampler is None
+
+
+@pytest.mark.asyncio
+async def test_unsupported_pipeline_rate_is_declared_as_default_and_input_is_resampled():
+    service = CapturingBosonRealtimeLLMService()
+    service._set_boson_input_sample_rate(44100)
+
+    assert service._boson_input_sample_rate == SAMPLE_RATE
+    await service._send_session_update()
+    assert service.sent[-1]["session"]["audio"]["input"]["format"]["rate"] == SAMPLE_RATE
+
+    chunk = b"\x00\x01" * 4410  # 100 ms at 44.1 kHz
+    for _ in range(10):
+        await service._send_user_audio(InputAudioRawFrame(audio=chunk, sample_rate=44100, num_channels=1))
+
+    one_second_at_default_rate = SAMPLE_RATE * 2
+    sent_bytes = appended_audio_bytes(service)
+    assert 0.9 * one_second_at_default_rate <= sent_bytes <= 1.1 * one_second_at_default_rate
+
+
+@pytest.mark.asyncio
+async def test_user_audio_is_resampled_when_a_frame_disagrees_with_the_session():
+    service = CapturingBosonRealtimeLLMService()
+    service._set_boson_input_sample_rate(16000)
+
+    chunk = b"\x00\x01" * 4800  # 100 ms at 48 kHz, e.g. a transport overriding the pipeline
+    for _ in range(10):
+        await service._send_user_audio(InputAudioRawFrame(audio=chunk, sample_rate=48000, num_channels=1))
+
+    one_second_at_16k = 16000 * 2
+    sent_bytes = appended_audio_bytes(service)
+    assert 0.9 * one_second_at_16k <= sent_bytes <= 1.1 * one_second_at_16k
+
+
+@pytest.mark.asyncio
+async def test_input_resampler_survives_a_change_of_incoming_sample_rate():
+    service = CapturingBosonRealtimeLLMService()
+    service._set_boson_input_sample_rate(16000)
+
+    # A stream resampler is pinned to one rate pair; the service must not reuse it
+    # across a change (pipecat raises ValueError in that case).
+    for rate in (48000, 44100, 48000):
+        await service._send_user_audio(
+            InputAudioRawFrame(audio=b"\x00\x01" * (rate // 10), sample_rate=rate, num_channels=1)
+        )
+        assert service.sent[-1]["type"] == "input_audio_buffer.append"
+        assert base64.b64decode(service.sent[-1]["audio"])
+
+    assert service._boson_input_resampler_rates == (48000, 16000)
+
+
+@pytest.mark.asyncio
+async def test_declared_input_sample_rate_survives_a_runtime_settings_update():
+    service = CapturingBosonRealtimeLLMService()
+    service._set_boson_input_sample_rate(16000)
+
+    await service._update_settings(service.Settings(system_instruction="new prompt"))
+
+    assert service.sent[-1]["type"] == "session.update"
+    assert service.sent[-1]["session"]["audio"]["input"]["format"]["rate"] == 16000
+
+
+def test_missing_pipeline_sample_rate_leaves_the_default_in_place():
+    service = CapturingBosonRealtimeLLMService()
+
+    assert service._boson_input_sample_rate == SAMPLE_RATE
+    service._set_boson_input_sample_rate(None)
+    assert service._boson_input_sample_rate == SAMPLE_RATE
+
+
+class LifecycleBosonRealtimeLLMService(CapturingBosonRealtimeLLMService):
+    """Runs the real setup()/start() chain with the websocket connect stubbed."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.connects = 0
+
+    async def _connect(self):
+        self.connects += 1
+        await self._send_session_update()
+
+
+PROCESSOR_SETUP_FIELDS = {field.name for field in dataclasses.fields(FrameProcessorSetup)}
+# pipecat-ai only carries the audio rates on FrameProcessorSetup from 1.8.0.
+SETUP_CARRIES_SAMPLE_RATE = "audio_in_sample_rate" in PROCESSOR_SETUP_FIELDS
+
+
+def make_task_manager() -> TaskManager:
+    manager = TaskManager()
+    try:
+        manager.get_event_loop()
+    except Exception:
+        # pipecat-ai < 1.5.0 learns the loop from an explicit setup() call rather than
+        # from its constructor; setup() is deprecated from 1.5.0 onwards.
+        from pipecat.utils.asyncio.task_manager import TaskManagerParams
+
+        manager.setup(TaskManagerParams(loop=asyncio.get_running_loop()))
+    return manager
+
+
+def make_processor_setup(**kwargs) -> FrameProcessorSetup:
+    supported = {name: value for name, value in kwargs.items() if name in PROCESSOR_SETUP_FIELDS}
+    return FrameProcessorSetup(
+        clock=SystemClock(), task_manager=make_task_manager(), pipeline_worker=None, **supported
+    )
+
+
+def appended_audio_bytes(service) -> int:
+    return sum(
+        len(base64.b64decode(payload["audio"]))
+        for payload in service.sent
+        if payload.get("type") == "input_audio_buffer.append"
+    )
+
+
+def session_update_rates(service) -> list[int]:
+    return [
+        payload["session"]["audio"]["input"]["format"]["rate"]
+        for payload in service.sent
+        if payload.get("type") == "session.update"
+    ]
+
+
+@pytest.mark.skipif(not SETUP_CARRIES_SAMPLE_RATE, reason="pipecat-ai < 1.8.0 has no setup rate")
+@pytest.mark.asyncio
+async def test_setup_declares_the_pipeline_rate_on_the_very_first_session_update():
+    service = LifecycleBosonRealtimeLLMService()
+
+    await service.setup(make_processor_setup(audio_in_sample_rate=16000, audio_out_sample_rate=24000))
+
+    # The rate must be recorded before the base class connects, so the first
+    # session.update already carries it.
+    assert service.connects == 1
+    assert session_update_rates(service)[0] == 16000
+
+
+@pytest.mark.skipif(not SETUP_CARRIES_SAMPLE_RATE, reason="pipecat-ai < 1.8.0 has no setup rate")
+@pytest.mark.asyncio
+async def test_start_does_not_read_the_deprecated_start_frame_rate_after_setup():
+    service = LifecycleBosonRealtimeLLMService()
+    await service.setup(make_processor_setup(audio_in_sample_rate=16000, audio_out_sample_rate=24000))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        await service.start(StartFrame(audio_in_sample_rate=16000, audio_out_sample_rate=24000))
+
+    assert [w for w in caught if "audio_in_sample_rate" in str(w.message)] == []
+    assert service._boson_input_sample_rate == 16000
+
+
+@pytest.mark.asyncio
+async def test_start_supplies_the_rate_when_setup_reported_none():
+    # pipecat-ai < 1.8.0 carries no rate on FrameProcessorSetup and connects in start().
+    service = LifecycleBosonRealtimeLLMService()
+    await service.setup(make_processor_setup(audio_in_sample_rate=0, audio_out_sample_rate=24000))
+    assert service._boson_input_sample_rate == SAMPLE_RATE
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        await service.start(StartFrame(audio_in_sample_rate=8000, audio_out_sample_rate=24000))
+    if SETUP_CARRIES_SAMPLE_RATE:
+        # Reading the deprecated field is deliberate on this path, so assert it happens
+        # rather than leaking the warning into every test run. Older pipecat-ai does not
+        # deprecate the field, so there is nothing to assert there.
+        assert [w for w in caught if "audio_in_sample_rate" in str(w.message)] != []
+
+    await service._send_session_update()
+
+    assert service._boson_input_sample_rate == 8000
+    assert session_update_rates(service)[-1] == 8000
+
+
+@pytest.mark.asyncio
+async def test_manual_turn_preroll_buffers_the_audio_that_was_actually_sent():
+    service = CapturingBosonRealtimeLLMService(turn_detection=False)
+    service._set_boson_input_sample_rate(16000)
+
+    chunk = b"\x00\x01" * 4800  # 100 ms at 48 kHz
+    await service._send_user_audio(InputAudioRawFrame(audio=chunk, sample_rate=48000, num_channels=1))
+
+    sent = base64.b64decode(service.sent[-1]["audio"])
+    # Pre-roll is replayed into the same session on barge-in, so it has to hold the
+    # resampled bytes rather than the originals.
+    assert bytes(service._user_audio_preroll_buffer) == sent
+    assert len(sent) < len(chunk)
+
+
+@pytest.mark.asyncio
+async def test_odd_length_audio_is_still_forwarded_when_resampling():
+    service = CapturingBosonRealtimeLLMService()
+    service._set_boson_input_sample_rate(16000)
+
+    odd = b"\x00\x01" * 2400 + b"\x02"  # 100 ms at 48 kHz plus a stray byte
+    for _ in range(3):
+        await service._send_user_audio(InputAudioRawFrame(audio=odd, sample_rate=48000, num_channels=1))
+
+    # Before the fix this raised inside the resampler and the whole frame was lost.
+    assert appended_audio_bytes(service) > 0
+
+
+@pytest.mark.asyncio
+async def test_disconnect_clears_the_input_resampler():
+    service = CapturingBosonRealtimeLLMService()
+    service._set_boson_input_sample_rate(16000)
+    await service._send_user_audio(InputAudioRawFrame(audio=b"\x00\x01" * 4800, sample_rate=48000, num_channels=1))
+    assert service._boson_input_resampler is not None
+
+    service._api_session_ready = True
+    await service._mark_websocket_disconnected()
+
+    # Stale filter history must not bleed into the next session.
+    assert service._boson_input_resampler is None
+    assert service._boson_input_resampler_rates is None
