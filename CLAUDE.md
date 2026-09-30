@@ -106,4 +106,8 @@ logged as expected rather than surfaced as an error frame.
 - Public entry point is `from pipecat_boson.realtime import BosonRealtimeLLMService`;
   it is lazily imported via `__getattr__` in `realtime/__init__.py` so importing
   the package doesn't pull Pipecat until the service is actually used.
-- Targets `pipecat-ai>=1.4.0,<2` (tested against 1.5.0) and Python 3.11+.
+- Targets `pipecat-ai>=1.4.0,<2` and Python 3.11+. CI tests the newest Pipecat plus
+  the older versions listed in the `compat` job in `.github/workflows/ci.yml`.
+- `assert_given` and `is_given` are imported with a `try`/`except` in `llm.py`
+  because Pipecat 1.8.0 moved them. Keep the fallback while the minimum supported
+  Pipecat is below 1.8.0.

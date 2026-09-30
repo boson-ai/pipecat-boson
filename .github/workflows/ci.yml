@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # This package tracks a fast-moving upstream. Poll on a schedule so a
+  # pipecat release that breaks us surfaces here, not in a user's traceback.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -33,7 +38,32 @@ jobs:
           enable-cache: true
       # The test extra is enough for the suite; dev additionally pulls the
       # heavy webrtc stack (opencv) needed only for the browser example.
+      # --upgrade-package keeps this job on the newest pipecat-ai even if a
+      # uv.lock is committed later; the weekly run depends on that.
+      - run: uv sync --extra test --upgrade-package pipecat-ai
+      - run: uv run --no-sync python -m pytest -q
+
+  compat:
+    name: pipecat ${{ matrix.pipecat-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Older Pipecat versions we still promise to support.
+        # The newest Pipecat is tested by the `test` job above,
+        # which always installs the latest release automatically.
+        #   1.4.0 = oldest supported version
+        #   1.7.0 = last version with assert_given in its old location
+        #   1.8.0 = first version with assert_given in its new location
+        pipecat-version: ["1.4.0", "1.7.0", "1.8.0"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+          enable-cache: true
       - run: uv sync --extra test
+      - run: uv pip install "pipecat-ai==${{ matrix.pipecat-version }}"
       - run: uv run --no-sync python -m pytest -q
 
   build:

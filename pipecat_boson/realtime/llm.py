@@ -33,7 +33,6 @@ from pipecat.processors.aggregators.llm_context import (
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.openai.realtime import events
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
-from pipecat.services.settings import assert_given, is_given
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
@@ -47,6 +46,12 @@ from .config import (
     normalize_ws_url,
     resolve_output_modalities,
 )
+
+
+try:  # pipecat-ai >= 1.8.0
+    from pipecat.utils.types import assert_given, is_given
+except ImportError:  # pipecat-ai < 1.8.0
+    from pipecat.services.settings import assert_given, is_given
 
 
 _BOSON_TERMINAL_SESSION_EVENT_TYPES = {

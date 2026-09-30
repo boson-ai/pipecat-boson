@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from types import SimpleNamespace
 
@@ -32,6 +33,12 @@ from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 import pipecat_boson.realtime.llm as realtime_llm
 from pipecat_boson.realtime import BosonRealtimeLLMService
+
+
+# pipecat-ai >= 1.8.0 gives run_test() a 1-second default budget for the pipeline
+# to start, which a cold CI runner can exceed. It is only an upper bound, so raise
+# it where supported; older run_test() has no start timeout.
+RUN_TEST_START_KWARGS = {"start_timeout": 10.0} if "start_timeout" in inspect.signature(run_test).parameters else {}
 
 
 class CapturingBosonRealtimeLLMService(BosonRealtimeLLMService):
@@ -242,6 +249,7 @@ async def test_pipecat_aggregator_tool_result_is_encoded_once_on_boson_wire():
             ),
         ],
         expected_up_frames=[LLMContextFrame],
+        **RUN_TEST_START_KWARGS,
     )
 
     service = CapturingBosonRealtimeLLMService()

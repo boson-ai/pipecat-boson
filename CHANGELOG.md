@@ -9,6 +9,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- Import correctly on `pipecat-ai` 1.8.0 and newer, which moved `assert_given` from `pipecat.services.settings` to `pipecat.utils.types`. The package previously failed to import on those versions. Older supported versions continue to work.
 - Omit `temperature` from realtime session updates unless callers configure it explicitly, allowing the server's default to apply.
 
 ## [0.1.3] - 2026-08-03
