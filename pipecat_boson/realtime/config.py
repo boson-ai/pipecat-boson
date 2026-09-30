@@ -8,6 +8,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 
 SAMPLE_RATE = 24000
+SUPPORTED_PCM_RATES = (8000, 16000, 24000, 48000)
 DEFAULT_OUTPUT_MODALITIES = ["audio"]
 VALID_OUTPUT_MODALITIES = ("text", "audio")
 MAX_OUTPUT_TOKENS_LIMIT = 4096
@@ -22,6 +23,11 @@ DEFAULT_TURN_DETECTION: dict[str, Any] = {
     "silence_duration_ms": 500,
     "threshold": 0.55,
 }
+
+
+def resolve_pcm_rate(rate: int | None) -> int:
+    """Return a PCM rate Boson accepts, falling back to 24 kHz."""
+    return int(rate) if rate in SUPPORTED_PCM_RATES else SAMPLE_RATE
 
 
 def normalize_ws_url(url: str, query_params: dict[str, str] | None = None) -> str:
@@ -150,11 +156,12 @@ def build_session_update_payload(
     input_audio_transcription: dict[str, Any] | object,
     input_audio_noise_reduction: dict[str, Any] | None | object,
     truncation: Literal["auto", "disabled"] = "auto",
+    input_sample_rate: int = SAMPLE_RATE,
 ) -> dict[str, Any]:
     """Build a complete Boson realtime ``session.update`` client event."""
 
     audio_input: dict[str, Any] = {
-        "format": {"type": "audio/pcm", "rate": SAMPLE_RATE},
+        "format": {"type": "audio/pcm", "rate": input_sample_rate},
         "turn_detection": turn_detection,
     }
     if input_audio_transcription is not UNSET:
