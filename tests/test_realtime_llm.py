@@ -1234,3 +1234,40 @@ async def test_reply_transcript_is_reported_as_spoken_text():
     assert spoken.will_be_spoken is True
     assert spoken.append_to_context is not False
     assert announced.text == spoken.text == "The capital is Rome."
+
+
+def make_turn_detection_delta(service, turn_detection):
+    return service.Settings(
+        session_properties=events.SessionProperties(
+            audio=events.AudioConfiguration(input=events.AudioInput(turn_detection=turn_detection))
+        )
+    )
+
+
+def sent_turn_detection(service):
+    return service.sent[-1]["session"]["audio"]["input"]["turn_detection"]
+
+
+@pytest.mark.asyncio
+async def test_manual_turn_mode_survives_an_unrelated_settings_update():
+    service = CapturingBosonRealtimeLLMService(turn_detection=False)
+
+    assert service._is_turn_detection_disabled() is True
+
+    await service._update_settings(
+        service.Settings(session_properties=events.SessionProperties(tool_choice="none"))
+    )
+
+    assert sent_turn_detection(service) is None
+    assert service._is_turn_detection_disabled() is True
+
+
+@pytest.mark.asyncio
+async def test_server_vad_sessions_report_turn_detection_as_enabled():
+    service = CapturingBosonRealtimeLLMService()
+
+    assert service._is_turn_detection_disabled() is False
+
+    await service._update_settings(make_turn_detection_delta(service, False))
+
+    assert service._is_turn_detection_disabled() is True

@@ -284,6 +284,15 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
 
         return "audio" in self._boson_output_modalities
 
+    def _is_turn_detection_disabled(self) -> bool:
+        """Whether the application, rather than Boson, drives turn taking.
+
+        Read from the Boson payload: a settings update replaces Pipecat's copy
+        wholesale, which would flip this answer without Boson being told.
+        """
+
+        return self._boson_turn_detection is None
+
     async def _connect(self):
         try:
             if self._websocket:
