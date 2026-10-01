@@ -13,13 +13,16 @@ from typing import Any, Literal
 from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import (
     Frame,
+    InputAudioRawFrame,
     LLMConfigureOutputFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMMessagesAppendFrame,
     LLMSetToolsFrame,
+    StartFrame,
     TTSStoppedFrame,
     UserStartedSpeakingFrame,
 )
@@ -30,13 +33,14 @@ from pipecat.processors.aggregators.llm_context import (
 from pipecat.processors.aggregators.llm_context import (
     is_given as is_context_value_given,
 )
-from pipecat.processors.frame_processor import FrameDirection
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
 from pipecat.services.openai.realtime import events
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
 from .config import (
+    SAMPLE_RATE,
     UNSET,
     build_input_audio_transcription,
     build_noise_reduction,
@@ -45,6 +49,7 @@ from .config import (
     input_audio_transcription_enabled,
     normalize_ws_url,
     resolve_output_modalities,
+    resolve_pcm_rate,
 )
 
 
@@ -209,6 +214,9 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
                 tool_choice=tool_choice,
                 audio=events.AudioConfiguration(
                     input=events.AudioInput(
+                        # Pipecat types this rate as Literal[24000], so the mirrored
+                        # settings always report 24 kHz input while the wire carries
+                        # _boson_input_sample_rate. Base Pipecat never reads it.
                         format=events.PCMAudioFormat(),
                         turn_detection=pipecat_turn_detection,
                         transcription=pipecat_transcription,
@@ -248,6 +256,10 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         self._boson_input_audio_transcription = transcription_config
         self._boson_input_audio_noise_reduction = noise_reduction_config
         self._boson_truncation = truncation
+        self._boson_input_sample_rate = SAMPLE_RATE
+        self._boson_input_resampler: Any = None
+        self._boson_input_resampler_rates: tuple[int, int] | None = None
+        self._boson_input_sample_rate_from_setup = False
         self._boson_pending_response_client_event_ids: set[str] = set()
         self._boson_active_response_ids: set[str] = set()
         self._boson_cancelled_response_ids: set[str] = set()
@@ -279,6 +291,39 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         """Whether this service is configured to emit realtime audio output frames."""
 
         return "audio" in self._boson_output_modalities
+
+    async def setup(self, setup: FrameProcessorSetup):
+        """Record the pipeline's input rate before the base class connects.
+
+        pipecat-ai >= 1.8.0 connects here and carries the rate on ``setup``.
+        """
+        rate = getattr(setup, "audio_in_sample_rate", None)
+        if rate:
+            self._set_boson_input_sample_rate(rate)
+            self._boson_input_sample_rate_from_setup = True
+        await super().setup(setup)
+
+    async def start(self, frame: StartFrame):
+        was_connected = self._websocket is not None
+        previous = self._boson_input_sample_rate
+        if not self._boson_input_sample_rate_from_setup:
+            # Deprecated since pipecat-ai 1.8.0 and warns when read, so only consult
+            # it when setup() reported nothing, i.e. on pipecat-ai < 1.8.0.
+            rate = getattr(frame, "audio_in_sample_rate", None)
+            if rate:
+                self._set_boson_input_sample_rate(rate)
+        await super().start(frame)
+        if was_connected and self._boson_input_sample_rate != previous:
+            await self._send_session_update()
+
+    def _set_boson_input_sample_rate(self, rate: int | None) -> None:
+        resolved = resolve_pcm_rate(rate)
+        if rate and resolved != rate:
+            logger.warning(
+                f"Boson realtime API does not accept {rate} Hz input audio; "
+                f"declaring {resolved} Hz and resampling input to match."
+            )
+        self._boson_input_sample_rate = resolved
 
     async def _connect(self):
         try:
@@ -343,6 +388,39 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
                 return
             await self.push_error(error_msg=f"Error sending client event: {exc}", exception=exc)
 
+    async def _send_user_audio(self, frame):
+        """Keep outgoing audio at the rate declared in ``session.update``.
+
+        Boson reads input audio at the declared rate, so a frame arriving at a
+        different rate (a transport overriding the pipeline rate, or a rate
+        Boson does not accept) has to be resampled before it is sent.
+        """
+
+        if frame.sample_rate != self._boson_input_sample_rate:
+            rates = (frame.sample_rate, self._boson_input_sample_rate)
+            if self._boson_input_resampler_rates != rates:
+                # A stream resampler is pinned to one rate pair and raises if reused
+                # across a change, so build a fresh one whenever the pair changes.
+                self._boson_input_resampler = create_stream_resampler()
+                self._boson_input_resampler_rates = rates
+            # The resampler reads int16 samples, so a stray trailing byte would raise
+            # and cost the whole frame; drop the byte instead.
+            audio = await self._boson_input_resampler.resample(
+                frame.audio[: len(frame.audio) // 2 * 2],
+                frame.sample_rate,
+                self._boson_input_sample_rate,
+            )
+            if not audio:
+                # A stream resampler emits nothing until its filter warms up; there is
+                # no point sending an empty append for that first chunk.
+                return
+            frame = InputAudioRawFrame(
+                audio=audio,
+                sample_rate=self._boson_input_sample_rate,
+                num_channels=frame.num_channels,
+            )
+        await super()._send_user_audio(frame)
+
     async def _mark_websocket_disconnected(self) -> None:
         if self._websocket is None and not self._api_session_ready:
             return
@@ -357,6 +435,10 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         self._boson_cancelled_response_client_event_ids.clear()
         self._boson_completed_transcription_item_ids.clear()
         self._boson_completed_transcription_item_id_order.clear()
+        # A stream resampler keeps ~0.2 s of history, which would otherwise bleed
+        # into the next session as an artefact.
+        self._boson_input_resampler = None
+        self._boson_input_resampler_rates = None
         await self._close_active_response_frames()
         await self.stop_all_metrics()
         if websocket is not None:
@@ -445,6 +527,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             input_audio_transcription=self._boson_input_audio_transcription,
             input_audio_noise_reduction=self._boson_input_audio_noise_reduction,
             truncation=self._boson_truncation,
+            input_sample_rate=self._boson_input_sample_rate,
         )
         logger.debug(f"Sending Boson session.update with tools={_tool_names(tools)}")
         await self.send_client_event(payload)

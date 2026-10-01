@@ -9,6 +9,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- Declare the pipeline's actual input sample rate in `session.update` instead of always claiming 24 kHz, and resample input audio only when a frame's rate differs from the declared one. Boson accepts 8, 16, 24 and 48 kHz PCM. Previously 16 kHz pipeline audio (Pipecat's default) was sent labelled as 24 kHz, which compressed server-side turn-detection timing by the ratio of the two rates, and 8 kHz telephony audio was not detected as speech at all.
 - Import correctly on `pipecat-ai` 1.8.0 and newer, which moved `assert_given` from `pipecat.services.settings` to `pipecat.utils.types`. The package previously failed to import on those versions. Older supported versions continue to work.
 - Omit `temperature` from realtime session updates unless callers configure it explicitly, allowing the server's default to apply.
 
