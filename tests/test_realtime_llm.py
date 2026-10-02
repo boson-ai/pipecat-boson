@@ -35,6 +35,7 @@ from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 import pipecat_boson.realtime.llm as realtime_llm
 from pipecat_boson.realtime import BosonRealtimeLLMService
+from pipecat_boson.realtime.config import DEFAULT_TURN_DETECTION
 
 
 # pipecat-ai >= 1.8.0 gives run_test() a 1-second default budget for the pipeline
@@ -1249,15 +1250,114 @@ def sent_turn_detection(service):
 
 
 @pytest.mark.asyncio
+async def test_default_turn_detection_survives_an_unrelated_settings_update():
+    service = CapturingBosonRealtimeLLMService()
+    await service._send_session_update()
+    before = sent_turn_detection(service)
+
+    await service._update_settings(service.Settings(system_instruction="new prompt"))
+
+    # Pipecat's TurnDetection model has no create_response/interrupt_response, so a
+    # round trip through it used to drop them from every later session.update.
+    assert sent_turn_detection(service) == before
+    assert before["create_response"] is True
+    assert before["interrupt_response"] is True
+
+
+@pytest.mark.asyncio
+async def test_boson_only_turn_detection_fields_survive_an_unrelated_settings_update():
+    service = CapturingBosonRealtimeLLMService(
+        turn_detection={"type": "server_vad", "threshold": 0.6, "min_speech_duration": 0.2}
+    )
+
+    await service._update_settings(service.Settings(system_instruction="new prompt"))
+
+    assert sent_turn_detection(service) == {
+        "type": "server_vad",
+        "threshold": 0.6,
+        "min_speech_duration": 0.2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_turn_detection_update_applies_changes_and_keeps_boson_only_fields():
+    service = CapturingBosonRealtimeLLMService(
+        turn_detection={"type": "server_vad", "threshold": 0.6, "min_speech_duration": 0.2}
+    )
+
+    await service._update_settings(make_turn_detection_delta(service, events.TurnDetection(threshold=0.7)))
+
+    turn_detection = sent_turn_detection(service)
+    assert turn_detection["threshold"] == 0.7
+    assert turn_detection["min_speech_duration"] == 0.2
+
+
+@pytest.mark.asyncio
+async def test_turn_detection_can_still_be_disabled_at_runtime():
+    service = CapturingBosonRealtimeLLMService()
+
+    await service._update_settings(make_turn_detection_delta(service, False))
+
+    assert sent_turn_detection(service) is None
+    # The wire payload and Pipecat's own copy have to agree: None disables server VAD
+    # on the wire, while the base class reads False to drive local turn handling.
+    assert service._is_turn_detection_disabled() is True
+
+
+@pytest.mark.asyncio
+async def test_switching_vad_type_replaces_rather_than_merges():
+    service = CapturingBosonRealtimeLLMService(
+        turn_detection={"type": "server_vad", "threshold": 0.6, "min_speech_duration": 0.2}
+    )
+
+    await service._update_settings(make_turn_detection_delta(service, events.SemanticTurnDetection()))
+
+    # server_vad fields must not leak into a semantic_vad payload
+    assert sent_turn_detection(service) == {"type": "semantic_vad"}
+
+
+@pytest.mark.asyncio
+async def test_turn_detection_update_without_a_type_keeps_the_configured_type():
+    service = CapturingBosonRealtimeLLMService(
+        turn_detection={"type": "server_vad", "threshold": 0.6, "min_speech_duration": 0.2}
+    )
+
+    # Pipecat's TurnDetection.type is optional, so the type has to come from the model
+    # class rather than the dumped fields, or an update would erase it.
+    await service._update_settings(make_turn_detection_delta(service, events.TurnDetection(type=None, threshold=0.7)))
+
+    turn_detection = sent_turn_detection(service)
+    assert turn_detection["type"] == "server_vad"
+    assert turn_detection["threshold"] == 0.7
+    assert turn_detection["min_speech_duration"] == 0.2
+
+
+def test_constructor_rejects_an_eagerness_boson_cannot_accept():
+    with pytest.raises(ValueError, match="eagerness"):
+        CapturingBosonRealtimeLLMService(turn_detection={"type": "semantic_vad", "eagerness": "high"})
+
+
+@pytest.mark.asyncio
+async def test_runtime_eagerness_is_dropped_instead_of_killing_the_session():
+    service = CapturingBosonRealtimeLLMService(turn_detection={"type": "semantic_vad"})
+
+    await service._update_settings(make_turn_detection_delta(service, events.SemanticTurnDetection(eagerness="high")))
+
+    # Raising mid-call would break a live session, so the value is dropped instead.
+    assert sent_turn_detection(service) == {"type": "semantic_vad"}
+
+
+@pytest.mark.asyncio
 async def test_manual_turn_mode_survives_an_unrelated_settings_update():
     service = CapturingBosonRealtimeLLMService(turn_detection=False)
 
     assert service._is_turn_detection_disabled() is True
 
-    await service._update_settings(
-        service.Settings(session_properties=events.SessionProperties(tool_choice="none"))
-    )
+    await service._update_settings(service.Settings(session_properties=events.SessionProperties(tool_choice="none")))
 
+    # The delta replaced Pipecat's copy of the session properties, which no longer
+    # says False, but Boson still has server VAD off — so the application has to keep
+    # driving turns or the session stops responding altogether.
     assert sent_turn_detection(service) is None
     assert service._is_turn_detection_disabled() is True
 
@@ -1271,3 +1371,130 @@ async def test_server_vad_sessions_report_turn_detection_as_enabled():
     await service._update_settings(make_turn_detection_delta(service, False))
 
     assert service._is_turn_detection_disabled() is True
+
+
+async def weather_tool(params, location: str = "San Francisco") -> None:
+    """Get the weather.
+
+    Args:
+        location: City or place name.
+    """
+
+
+@pytest.mark.asyncio
+async def test_tools_survive_a_settings_update_that_replaces_session_properties():
+    service = CapturingBosonRealtimeLLMService(tools=[weather_tool])
+
+    await service._update_settings(make_turn_detection_delta(service, events.TurnDetection(threshold=0.7)))
+
+    assert [tool["name"] for tool in service.sent[-1]["session"]["tools"]] == ["weather_tool"]
+
+
+@pytest.mark.asyncio
+async def test_service_tools_survive_a_settings_update_so_handlers_are_kept():
+    service = CapturingBosonRealtimeLLMService(tools=[weather_tool])
+
+    await service._update_settings(make_turn_detection_delta(service, events.TurnDetection(threshold=0.7)))
+
+    # Pipecat prunes every registered tool handler when this returns nothing.
+    assert service._service_tools() is not None
+
+
+@pytest.mark.asyncio
+async def test_tools_can_still_be_cleared_with_a_set_tools_frame():
+    service = CapturingBosonRealtimeLLMService(tools=[weather_tool])
+
+    # Pipecat's SessionProperties stores tools=[] as None, so a settings update cannot
+    # express "no tools"; LLMSetToolsFrame is the path that can.
+    await service.process_frame(LLMSetToolsFrame(tools=[]), FrameDirection.DOWNSTREAM)
+
+    assert service.sent[-1]["session"]["tools"] == []
+
+
+@pytest.mark.asyncio
+async def test_partial_turn_detection_update_keeps_unmentioned_fields():
+    service = CapturingBosonRealtimeLLMService(
+        turn_detection={
+            "type": "server_vad",
+            "threshold": 0.6,
+            "prefix_padding_ms": 100,
+            "silence_duration_ms": 1200,
+            "min_speech_duration": 0.2,
+        }
+    )
+
+    await service._update_settings(make_turn_detection_delta(service, events.TurnDetection(threshold=0.7)))
+
+    # Pipecat's model carries defaults for padding and silence, which must not be
+    # mistaken for a caller asking to change them.
+    assert sent_turn_detection(service) == {
+        "type": "server_vad",
+        "threshold": 0.7,
+        "prefix_padding_ms": 100,
+        "silence_duration_ms": 1200,
+        "min_speech_duration": 0.2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_disabling_then_re_enabling_restores_the_configured_payload():
+    configured = {
+        "type": "server_vad",
+        "threshold": 0.6,
+        "prefix_padding_ms": 100,
+        "min_speech_duration": 0.2,
+    }
+    service = CapturingBosonRealtimeLLMService(turn_detection=dict(configured))
+
+    await service._update_settings(make_turn_detection_delta(service, False))
+    assert sent_turn_detection(service) is None
+
+    await service._update_settings(make_turn_detection_delta(service, events.TurnDetection(threshold=0.7)))
+
+    assert sent_turn_detection(service) == {**configured, "threshold": 0.7}
+
+
+@pytest.mark.asyncio
+async def test_a_type_less_server_vad_update_after_a_semantic_switch_does_not_mix_fields():
+    service = CapturingBosonRealtimeLLMService(turn_detection={"type": "server_vad", "threshold": 0.6})
+    await service._update_settings(make_turn_detection_delta(service, events.SemanticTurnDetection()))
+    assert sent_turn_detection(service) == {"type": "semantic_vad"}
+
+    # TurnDetection means server VAD even when its type field is left out.
+    await service._update_settings(make_turn_detection_delta(service, events.TurnDetection(type=None, threshold=0.7)))
+
+    assert sent_turn_detection(service) == {"type": "server_vad", "threshold": 0.7}
+
+
+@pytest.mark.asyncio
+async def test_update_to_a_payload_without_a_type_keeps_boson_only_fields():
+    # Boson defaults a missing type itself, so a caller may never set one; that must
+    # not read as a VAD type change on the first update.
+    service = CapturingBosonRealtimeLLMService(turn_detection={"threshold": 0.6, "min_speech_duration": 0.2})
+
+    await service._update_settings(make_turn_detection_delta(service, events.TurnDetection(threshold=0.7)))
+
+    assert sent_turn_detection(service) == {
+        "type": "server_vad",
+        "threshold": 0.7,
+        "min_speech_duration": 0.2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_re_enabling_with_true_uses_the_defaults_when_nothing_was_configured():
+    service = CapturingBosonRealtimeLLMService(turn_detection=False)
+
+    await service._update_settings(make_turn_detection_delta(service, True))
+
+    assert sent_turn_detection(service) == DEFAULT_TURN_DETECTION
+    assert service._is_turn_detection_disabled() is False
+
+
+@pytest.mark.asyncio
+async def test_the_remembered_turn_detection_payload_is_not_aliased():
+    service = CapturingBosonRealtimeLLMService(turn_detection={"type": "server_vad", "threshold": 0.6})
+
+    await service._update_settings(make_turn_detection_delta(service, events.TurnDetection(threshold=0.7)))
+
+    assert service._boson_turn_detection is not service._boson_last_enabled_turn_detection

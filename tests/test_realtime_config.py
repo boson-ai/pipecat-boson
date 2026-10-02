@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from pipecat_boson.realtime.config import (
+    SUPPORTED_SEMANTIC_EAGERNESS,
     UNSET,
     build_input_audio_transcription,
     build_noise_reduction,
@@ -162,3 +163,19 @@ def test_build_session_update_payload_can_omit_or_clear_noise_reduction():
 
     assert "noise_reduction" not in omitted["session"]["audio"]["input"]
     assert cleared["session"]["audio"]["input"]["noise_reduction"] is None
+
+
+def test_build_turn_detection_rejects_an_eagerness_boson_cannot_accept():
+    # Boson terminates the session for any value other than "auto", so fail loudly at
+    # construction rather than on the wire.
+    for eagerness in ("low", "medium", "high"):
+        with pytest.raises(ValueError, match="eagerness"):
+            build_turn_detection({"type": "semantic_vad", "eagerness": eagerness})
+
+
+def test_build_turn_detection_keeps_the_supported_eagerness():
+    for eagerness in SUPPORTED_SEMANTIC_EAGERNESS:
+        assert build_turn_detection({"type": "semantic_vad", "eagerness": eagerness}) == {
+            "type": "semantic_vad",
+            "eagerness": eagerness,
+        }
