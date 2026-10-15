@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- `output_audio_model` and `output_audio_temperature` select the TTS model that voices replies (for example `higgs-realtime-tts`) and its sampling temperature. Both are omitted by default, leaving the choice to the server.
+
 ### Fixed
 
 - Import correctly on `pipecat-ai` 1.8.0 and newer, which moved `assert_given` from `pipecat.services.settings` to `pipecat.utils.types`. The package previously failed to import on those versions. Older supported versions continue to work.

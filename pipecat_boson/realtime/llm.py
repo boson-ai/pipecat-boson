@@ -142,6 +142,8 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         tools: Any = UNSET,
         tool_choice: Any = "auto",
         speed: float = 1.0,
+        output_audio_model: str | None = None,
+        output_audio_temperature: float | None = None,
         turn_detection: Any = UNSET,
         input_audio_transcription: Any = UNSET,
         input_audio_transcription_model: str = "",
@@ -166,6 +168,11 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             max_output_tokens: Maximum output tokens, or ``"inf"``.
             tools: Optional tools to advertise in ``session.update``.
             tool_choice: OpenAI-compatible tool choice value.
+            output_audio_model: Optional TTS model that voices the reply, such
+                as ``"higgs-realtime-tts"``. Omit it to use the server default.
+                The server rejects a model the endpoint does not serve.
+            output_audio_temperature: Optional sampling temperature for the TTS
+                model. Omit it to use the server default.
             turn_detection: Server VAD config. Omit for the default server VAD;
                 pass ``False`` or ``None`` to use local/manual turn boundaries.
             input_audio_transcription: Optional transcription payload. Passing
@@ -244,6 +251,8 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         self._boson_max_output_tokens = max_output_tokens
         self._boson_tool_choice = tool_choice
         self._boson_speed = speed
+        self._boson_output_audio_model = output_audio_model
+        self._boson_output_audio_temperature = output_audio_temperature
         self._boson_turn_detection = turn_detection_config
         self._boson_input_audio_transcription = transcription_config
         self._boson_input_audio_noise_reduction = noise_reduction_config
@@ -445,6 +454,8 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             input_audio_transcription=self._boson_input_audio_transcription,
             input_audio_noise_reduction=self._boson_input_audio_noise_reduction,
             truncation=self._boson_truncation,
+            output_audio_model=self._boson_output_audio_model,
+            output_audio_temperature=self._boson_output_audio_temperature,
         )
         logger.debug(f"Sending Boson session.update with tools={_tool_names(tools)}")
         await self.send_client_event(payload)

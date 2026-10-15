@@ -168,6 +168,24 @@ Select **WebSocket** in the page before connecting. Both commands use the
 `webrtc` extra because it also installs the Pipecat runner used by the browser
 example.
 
+## Choose the voice model
+
+Higgs Realtime runs as a two-stage pipeline: `higgs-realtime` hears the
+caller's audio and writes the reply, and a TTS model speaks it. Pick that TTS
+model, and its sampling temperature, with `output_audio_model` and
+`output_audio_temperature`:
+
+```python
+llm = BosonRealtimeLLMService(
+    url=os.environ["BOSON_REALTIME_URL"],
+    api_key=os.environ["BOSON_API_KEY"],
+    model="higgs-realtime",
+    output_audio_model="higgs-realtime-tts",
+)
+```
+
+Both are omitted by default, which leaves the choice to the server.
+
 ## Receive user transcripts
 
 Set an input transcription model to receive finalized user transcripts as
@@ -318,6 +336,8 @@ Optional session settings supported by Higgs Realtime:
 | `instructions` | Helpful assistant prompt | System instructions used to initialize the conversation. |
 | `output_modalities` | `["audio"]` | Exactly `["audio"]` or `["text"]`. |
 | `temperature` | Not set | Optional sampling temperature. When omitted, the server default is used. |
+| `output_audio_model` | Not set | TTS model that voices the reply, for example `"higgs-realtime-tts"`. When omitted, the server default is used; an unknown model ends the session with an error. |
+| `output_audio_temperature` | Not set | Optional sampling temperature for the TTS model. When omitted, the server default is used. |
 | `max_output_tokens` | `"inf"` | Maximum response tokens. Numeric values are capped at `4096`. |
 | `tools` | Not set | Python functions or Pipecat-compatible tool definitions. |
 | `tool_choice` | `"auto"` | Tool selection behavior used when tools are available. |

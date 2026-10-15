@@ -162,3 +162,32 @@ def test_build_session_update_payload_can_omit_or_clear_noise_reduction():
 
     assert "noise_reduction" not in omitted["session"]["audio"]["input"]
     assert cleared["session"]["audio"]["input"]["noise_reduction"] is None
+
+
+def test_build_session_update_payload_sets_output_audio_model_only_when_given():
+    base_kwargs = {
+        "event_id": "evt_1",
+        "model": "higgs-realtime",
+        "voice": "default",
+        "instructions": "Be brief.",
+        "output_modalities": ["audio"],
+        "temperature": None,
+        "max_output_tokens": "inf",
+        "tool_choice": "auto",
+        "tools": None,
+        "speed": 1.0,
+        "turn_detection": None,
+        "input_audio_transcription": UNSET,
+        "input_audio_noise_reduction": UNSET,
+    }
+
+    default = build_session_update_payload(**base_kwargs)
+    two_stage = build_session_update_payload(
+        output_audio_model="higgs-realtime-tts", output_audio_temperature=0.6, **base_kwargs
+    )
+
+    assert "model" not in default["session"]["audio"]["output"]
+    assert "temperature" not in default["session"]["audio"]["output"]
+    assert two_stage["session"]["audio"]["output"]["model"] == "higgs-realtime-tts"
+    assert two_stage["session"]["audio"]["output"]["temperature"] == 0.6
+    assert "temperature" not in two_stage["session"]

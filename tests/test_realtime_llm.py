@@ -277,6 +277,20 @@ async def test_session_update_omits_unspecified_temperature():
     assert payload["session"]["audio"]["output"]["speed"] == 1.0
 
 
+@pytest.mark.asyncio
+async def test_session_update_sends_output_audio_model():
+    service = CapturingBosonRealtimeLLMService(
+        output_audio_model="higgs-realtime-tts",
+        output_audio_temperature=0.6,
+    )
+
+    await service._send_session_update()
+
+    output = service.sent[-1]["session"]["audio"]["output"]
+    assert output["model"] == "higgs-realtime-tts"
+    assert output["temperature"] == 0.6
+
+
 def test_constructor_uses_public_realtime_model_by_default():
     service = BosonRealtimeLLMService(url="ws://localhost:1234/v1/realtime/")
 

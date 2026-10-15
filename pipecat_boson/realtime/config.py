@@ -150,6 +150,8 @@ def build_session_update_payload(
     input_audio_transcription: dict[str, Any] | object,
     input_audio_noise_reduction: dict[str, Any] | None | object,
     truncation: Literal["auto", "disabled"] = "auto",
+    output_audio_model: str | None = None,
+    output_audio_temperature: float | None = None,
 ) -> dict[str, Any]:
     """Build a complete Boson realtime ``session.update`` client event."""
 
@@ -184,6 +186,11 @@ def build_session_update_payload(
             "truncation": truncation,
         },
     }
+    audio_output = payload["session"]["audio"]["output"]
+    if output_audio_model:
+        audio_output["model"] = output_audio_model
+    if output_audio_temperature is not None:
+        audio_output["temperature"] = output_audio_temperature
     if temperature is not None:
         payload["session"]["temperature"] = temperature
     return payload
