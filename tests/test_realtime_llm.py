@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.frames.frames import (
+    AggregatedTextFrame,
     Frame,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
@@ -21,6 +22,7 @@ from pipecat.frames.frames import (
     LLMSetToolsFrame,
     LLMTextFrame,
     TranscriptionFrame,
+    TTSTextFrame,
     UserStartedSpeakingFrame,
 )
 from pipecat.processors.aggregators.llm_context import NOT_GIVEN as LLM_CONTEXT_NOT_GIVEN
@@ -1225,3 +1227,24 @@ async def test_session_created_event_notifies_application_handler():
 
     assert should_continue is True
     assert received_session_ids == ["24198f53"]
+
+
+@pytest.mark.asyncio
+async def test_reply_transcript_is_reported_as_spoken_text():
+    service = CapturingBosonRealtimeLLMService()
+
+    await service._push_output_transcript_text_frames("The capital is Rome.")
+
+    llm_text, announced, spoken = service.pushed
+    # bot-llm-text for RTVI, kept out of the context (the TTS text goes there).
+    assert type(llm_text) is LLMTextFrame
+    assert llm_text.append_to_context is False
+    # RTVI 2 "new": opens the assistant message in the playground.
+    assert type(announced) is AggregatedTextFrame
+    assert announced.will_be_spoken is True
+    assert announced.append_to_context is False
+    # RTVI 2 "completed": the text the caller heard, added to the context.
+    assert type(spoken) is TTSTextFrame
+    assert spoken.will_be_spoken is True
+    assert spoken.append_to_context is not False
+    assert announced.text == spoken.text == "The capital is Rome."

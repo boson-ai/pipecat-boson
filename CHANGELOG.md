@@ -13,6 +13,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- Report the reply transcript as text that is being spoken. RTVI 2 clients, such as the Pipecat playground (prebuilt 1.13) and the voice UI kit, showed every assistant message empty because the text arrived as unspoken.
 - Import correctly on `pipecat-ai` 1.8.0 and newer, which moved `assert_given` from `pipecat.services.settings` to `pipecat.utils.types`. The package previously failed to import on those versions. Older supported versions continue to work.
 - Omit `temperature` from realtime session updates unless callers configure it explicitly, allowing the server's default to apply.
 
