@@ -14,13 +14,16 @@ from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import (
+    AggregatedTextFrame,
     Frame,
     LLMConfigureOutputFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMMessagesAppendFrame,
     LLMSetToolsFrame,
+    LLMTextFrame,
     TTSStoppedFrame,
+    TTSTextFrame,
     UserStartedSpeakingFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
@@ -33,6 +36,7 @@ from pipecat.processors.aggregators.llm_context import (
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.openai.realtime import events
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
+from pipecat.utils.text.base_text_aggregator import AggregationType
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
@@ -767,6 +771,32 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         if self._is_stale_response_event(evt):
             return
         await super()._handle_evt_text_delta(evt)
+
+    async def _push_output_transcript_text_frames(self, text: str):
+        """Report the reply transcript as text that is being spoken.
+
+        Boson speaks this text itself. The base class pushes it as a
+        ``TTSTextFrame`` without ``will_be_spoken``, so RTVI 2 clients (the
+        Pipecat playground, the voice UI kit) file every reply as unspoken and
+        leave the assistant's message empty. Announce each piece the way a TTS
+        service does instead: an ``AggregatedTextFrame`` that will be spoken
+        (RTVI ``spoken_status: new``), then the ``TTSTextFrame`` once it is
+        (``completed``).
+        """
+        llm_text_frame = LLMTextFrame(text)
+        llm_text_frame.append_to_context = False
+        await self.push_frame(llm_text_frame)
+
+        announced = AggregatedTextFrame(text, aggregated_by=AggregationType.SENTENCE)
+        announced.append_to_context = False
+        announced.will_be_spoken = True
+        announced.includes_inter_frame_spaces = True
+        await self.push_frame(announced)
+
+        spoken = TTSTextFrame(text, aggregated_by=AggregationType.SENTENCE)
+        spoken.will_be_spoken = True
+        spoken.includes_inter_frame_spaces = True
+        await self.push_frame(spoken)
 
     async def _handle_evt_audio_transcript_delta(self, evt):
         if self._is_stale_response_event(evt):
