@@ -260,6 +260,9 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         self._boson_pending_message_appends: list[LLMMessagesAppendFrame] = []
         self._boson_completed_transcription_item_ids: set[str] = set()
         self._boson_completed_transcription_item_id_order: deque[str] = deque()
+        # call_ids of tool calls the server runs itself (server tools such as
+        # web_search). They are not ours to run or answer.
+        self._boson_server_call_ids: deque[str] = deque(maxlen=_BOSON_TRANSCRIPTION_DEDUP_CACHE_SIZE)
         self._boson_terminal_session_event_type: str | None = None
         self._boson_response_start_frame_active = False
 
@@ -612,7 +615,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         item = evt.item
         item_id = getattr(item, "id", None)
 
-        if getattr(item, "type", None) == "function_call":
+        if getattr(item, "type", None) == "function_call" and not self._is_server_executed(item):
             call_id = getattr(item, "call_id", None)
             if call_id and call_id not in self._pending_function_calls:
                 self._pending_function_calls[call_id] = item
@@ -886,12 +889,35 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
 
     def _track_function_call_item(self, event: dict[str, Any]) -> None:
         item = event.get("item") or {}
-        if item.get("type") != "function_call":
+        if item.get("type") != "function_call" or self._is_server_executed(item):
             return
         call_id = item.get("call_id")
         if not call_id or call_id in self._pending_function_calls:
             return
         self._pending_function_calls[call_id] = _to_attr(item)
+
+    def _is_server_executed(self, item: Any) -> bool:
+        """Whether a function_call item is one the server runs itself.
+
+        Server tools (``{"type": "web_search"}``) show up as ordinary
+        ``function_call`` items with ``executor: "server"``. The server runs
+        them, adds the ``function_call_output`` and continues the response on
+        its own; a client must not run them, answer them or request a response.
+        """
+        executor = item.get("executor") if isinstance(item, dict) else getattr(item, "executor", None)
+        if executor != "server":
+            return False
+        call_id = item.get("call_id") if isinstance(item, dict) else getattr(item, "call_id", None)
+        if call_id and call_id not in self._boson_server_call_ids:
+            self._boson_server_call_ids.append(call_id)
+            name = item.get("name") if isinstance(item, dict) else getattr(item, "name", None)
+            logger.debug(f"Server is running tool {name!r} (call_id={call_id}); not running it here")
+        return True
+
+    async def _handle_evt_function_call_arguments_done(self, evt):
+        if getattr(evt, "call_id", None) in self._boson_server_call_ids:
+            return
+        await super()._handle_evt_function_call_arguments_done(evt)
 
     def _current_model(self) -> str:
         if is_given(self._settings.model) and self._settings.model:

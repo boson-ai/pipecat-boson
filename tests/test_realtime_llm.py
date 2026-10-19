@@ -1234,3 +1234,58 @@ async def test_reply_transcript_is_reported_as_spoken_text():
     assert spoken.will_be_spoken is True
     assert spoken.append_to_context is not False
     assert announced.text == spoken.text == "The capital is Rome."
+
+
+@pytest.mark.asyncio
+async def test_server_executed_tool_calls_are_not_run_or_answered():
+    # A server tool (web_search) arrives as a function_call with executor "server".
+    # The server runs it, adds the output and continues; the client must do nothing.
+    service = CapturingBosonRealtimeLLMService()
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    service._context = LLMContext([])
+    ran = []
+
+    async def web_search(params):
+        ran.append(params)
+
+    service.register_function("web_search", web_search)
+    item = {
+        "id": "item_1",
+        "type": "function_call",
+        "name": "web_search",
+        "call_id": "call_server",
+        "arguments": "",
+        "executor": "server",
+    }
+    sent = len(service.sent)
+
+    await service._dispatch_boson_server_event(
+        {"type": "response.output_item.added", "response_id": "r", "item": item}
+    )
+    await service._dispatch_boson_server_event({"type": "conversation.item.added", "item": item})
+    await service._dispatch_boson_server_event(
+        {"type": "response.function_call_arguments.done", "call_id": "call_server", "arguments": '{"queries": ["x"]}'}
+    )
+
+    assert "call_server" not in service._pending_function_calls
+    assert ran == []
+    assert not [e for e in service.sent[sent:] if e["type"] in ("conversation.item.create", "response.create")]
+
+
+@pytest.mark.asyncio
+async def test_client_executed_tool_calls_are_still_tracked():
+    service = CapturingBosonRealtimeLLMService()
+    item = {
+        "id": "item_2",
+        "type": "function_call",
+        "name": "get_time",
+        "call_id": "call_client",
+        "executor": "client",
+    }
+
+    await service._dispatch_boson_server_event(
+        {"type": "response.output_item.added", "response_id": "r", "item": item}
+    )
+
+    assert "call_client" in service._pending_function_calls
