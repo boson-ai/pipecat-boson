@@ -16,6 +16,7 @@ from pipecat_boson.realtime.config import (
     normalize_ws_url,
     resolve_output_modalities,
     resolve_pcm_rate,
+    split_whole_samples,
 )
 
 
@@ -172,6 +173,15 @@ def test_resolve_pcm_rate_keeps_supported_rates_and_falls_back_otherwise():
         assert resolve_pcm_rate(rate) == rate
     for rate in (None, 0, 11025, 22050, 44100, 96000):
         assert resolve_pcm_rate(rate) == SAMPLE_RATE
+
+
+def test_split_whole_samples_carries_a_split_sample_into_the_next_chunk():
+    # Each byte pair is one 16-bit sample: b"a1b1" is two samples, b"a1b" ends halfway through one.
+    assert split_whole_samples(b"", b"a1b1") == (b"a1b1", b"")
+    assert split_whole_samples(b"", b"a1b") == (b"a1", b"b")
+    assert split_whole_samples(b"b", b"1c1") == (b"b1c1", b"")
+    assert split_whole_samples(b"b", b"1c") == (b"b1", b"c")
+    assert split_whole_samples(b"", b"a") == (b"", b"a")
 
 
 def test_build_session_update_payload_carries_configured_sample_rates():

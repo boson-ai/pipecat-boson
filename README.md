@@ -328,9 +328,11 @@ Optional session settings supported by Higgs Realtime:
 | `input_audio_noise_reduction` | Not set | OpenAI-compatible `{"type": "near_field"}` or `{"type": "far_field"}` input noise reduction setting. The corresponding type string is also accepted. |
 | `truncation` | `"auto"` | `"auto"` enables smart context summarization when the selected model publishes a context limit; `"disabled"` turns it off. |
 
-This Pipecat integration sends Boson 24 kHz PCM audio output. For input it
-declares the pipeline's own `audio_in_sample_rate`, which Higgs Realtime accepts
-at 8000, 16000, 24000 or 48000 Hz; any other rate is resampled to 24 kHz.
+This Pipecat integration asks Boson for 24 kHz PCM audio output. For input it
+declares the rate the audio arrives at: the pipeline's `audio_in_sample_rate`, or
+the transport's own rate if that differs. Higgs Realtime accepts 8000, 16000,
+24000 or 48000 Hz; audio at any other rate is resampled to the declared rate
+(24 kHz when the pipeline's own rate is not one of those).
 
 ## Next steps
 

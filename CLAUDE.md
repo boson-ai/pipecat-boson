@@ -40,7 +40,8 @@ The whole package is two source modules under `pipecat_boson/realtime/`:
 - **`config.py`** — pure, side-effect-free helpers that build Boson wire
   payloads and validate options. No Pipecat/websocket imports. This is where the
   Boson session-shape rules live: single output modality (`["audio"]` or
-  `["text"]`, never mixed), 24 kHz PCM (`SAMPLE_RATE`), default server VAD
+  `["text"]`, never mixed), 24 kHz PCM output (`SAMPLE_RATE`), the PCM input
+  rates Boson accepts (`SUPPORTED_PCM_RATES`), default server VAD
   (`DEFAULT_TURN_DETECTION`), OpenAI-shaped noise reduction, max-token clamping,
   and `session.update` assembly (`build_session_update_payload`). Prefer adding
   payload logic here and keeping it independently unit-testable
@@ -98,6 +99,14 @@ logged as expected rather than surfaced as an error frame.
   by `_normalize_response_create_payload` before send.
 - `SimpleNamespace`-based attribute access (`_to_attr`) is used to read incoming
   JSON events uniformly.
+- Input audio: `session.update` declares the rate the audio arrives at, read in
+  `setup()` on pipecat-ai >= 1.8.0 and in `start()` before that, in both cases
+  before the base class connects. A frame at another rate Boson accepts
+  re-declares it; any other rate is resampled to the declared rate.
+- Every `input_audio_buffer.append` must hold whole PCM16 samples: Boson rejects
+  an odd byte count with a 400 that the client treats as fatal. `_send_user_audio`
+  carries a split sample into the next frame, and `_replay_user_audio_preroll`
+  drops a leading half sample.
 
 ## Conventions
 

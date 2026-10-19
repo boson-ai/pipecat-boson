@@ -30,6 +30,13 @@ def resolve_pcm_rate(rate: int | None) -> int:
     return int(rate) if rate in SUPPORTED_PCM_RATES else SAMPLE_RATE
 
 
+def split_whole_samples(leftover: bytes, audio: bytes) -> tuple[bytes, bytes]:
+    """Join ``leftover`` onto ``audio`` and split it into whole PCM16 samples and a leftover byte."""
+    audio = leftover + audio
+    cut = len(audio) - len(audio) % 2
+    return audio[:cut], audio[cut:]
+
+
 def normalize_ws_url(url: str, query_params: dict[str, str] | None = None) -> str:
     """Normalize an HTTP(S) or WebSocket URL and merge optional query params."""
 

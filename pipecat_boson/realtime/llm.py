@@ -45,6 +45,7 @@ from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
 from .config import (
     SAMPLE_RATE,
+    SUPPORTED_PCM_RATES,
     UNSET,
     build_input_audio_transcription,
     build_noise_reduction,
@@ -54,6 +55,7 @@ from .config import (
     normalize_ws_url,
     resolve_output_modalities,
     resolve_pcm_rate,
+    split_whole_samples,
 )
 
 
@@ -263,6 +265,8 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         self._boson_input_sample_rate = SAMPLE_RATE
         self._boson_input_resampler: Any = None
         self._boson_input_resampler_rates: tuple[int, int] | None = None
+        self._boson_input_leftover = b""
+        self._boson_input_leftover_rate: int | None = None
         self._boson_input_sample_rate_from_setup = False
         self._boson_pending_response_client_event_ids: set[str] = set()
         self._boson_active_response_ids: set[str] = set()
@@ -308,8 +312,6 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         await super().setup(setup)
 
     async def start(self, frame: StartFrame):
-        was_connected = self._websocket is not None
-        previous = self._boson_input_sample_rate
         if not self._boson_input_sample_rate_from_setup:
             # Deprecated since pipecat-ai 1.8.0 and warns when read, so only consult
             # it when setup() reported nothing, i.e. on pipecat-ai < 1.8.0.
@@ -317,8 +319,6 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             if rate:
                 self._set_boson_input_sample_rate(rate)
         await super().start(frame)
-        if was_connected and self._boson_input_sample_rate != previous:
-            await self._send_session_update()
 
     def _set_boson_input_sample_rate(self, rate: int | None) -> None:
         resolved = resolve_pcm_rate(rate)
@@ -393,37 +393,41 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             await self.push_error(error_msg=f"Error sending client event: {exc}", exception=exc)
 
     async def _send_user_audio(self, frame):
-        """Keep outgoing audio at the rate declared in ``session.update``.
+        """Send input audio at the rate declared in ``session.update``.
 
-        Boson reads input audio at the declared rate, so a frame arriving at a
-        different rate (a transport overriding the pipeline rate, or a rate
-        Boson does not accept) has to be resampled before it is sent.
+        A frame at another rate Boson accepts re-declares it; any other rate is resampled.
         """
-
-        if frame.sample_rate != self._boson_input_sample_rate:
-            rates = (frame.sample_rate, self._boson_input_sample_rate)
+        if frame.sample_rate in SUPPORTED_PCM_RATES and frame.sample_rate != self._boson_input_sample_rate:
+            # A transport can run at its own rate; declare it rather than convert twice.
+            self._set_boson_input_sample_rate(frame.sample_rate)
+            await self._send_session_update()
+        audio = self._split_whole_input_samples(frame)
+        sample_rate = frame.sample_rate
+        if sample_rate != self._boson_input_sample_rate:
+            rates = (sample_rate, self._boson_input_sample_rate)
             if self._boson_input_resampler_rates != rates:
                 # A stream resampler is pinned to one rate pair and raises if reused
                 # across a change, so build a fresh one whenever the pair changes.
                 self._boson_input_resampler = create_stream_resampler()
                 self._boson_input_resampler_rates = rates
-            # The resampler reads int16 samples, so a stray trailing byte would raise
-            # and cost the whole frame; drop the byte instead.
-            audio = await self._boson_input_resampler.resample(
-                frame.audio[: len(frame.audio) // 2 * 2],
-                frame.sample_rate,
-                self._boson_input_sample_rate,
-            )
-            if not audio:
-                # A stream resampler emits nothing until its filter warms up; there is
-                # no point sending an empty append for that first chunk.
-                return
-            frame = InputAudioRawFrame(
-                audio=audio,
-                sample_rate=self._boson_input_sample_rate,
-                num_channels=frame.num_channels,
-            )
+            audio = await self._boson_input_resampler.resample(audio, sample_rate, self._boson_input_sample_rate)
+            sample_rate = self._boson_input_sample_rate
+        if not audio:
+            return
+        if audio is not frame.audio:
+            frame = InputAudioRawFrame(audio=audio, sample_rate=sample_rate, num_channels=frame.num_channels)
         await super()._send_user_audio(frame)
+
+    def _split_whole_input_samples(self, frame) -> bytes:
+        """Return the frame's whole PCM16 samples, carrying a split sample into the next frame."""
+        if frame.sample_rate != self._boson_input_leftover_rate:
+            # A leftover byte from audio at another rate would misalign this stream.
+            self._boson_input_leftover = b""
+            self._boson_input_leftover_rate = frame.sample_rate
+        if not self._boson_input_leftover and len(frame.audio) % 2 == 0:
+            return frame.audio
+        audio, self._boson_input_leftover = split_whole_samples(self._boson_input_leftover, frame.audio)
+        return audio
 
     async def _mark_websocket_disconnected(self) -> None:
         if self._websocket is None and not self._api_session_ready:
@@ -439,10 +443,12 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         self._boson_cancelled_response_client_event_ids.clear()
         self._boson_completed_transcription_item_ids.clear()
         self._boson_completed_transcription_item_id_order.clear()
-        # A stream resampler keeps ~0.2 s of history, which would otherwise bleed
-        # into the next session as an artefact.
+        # A stream resampler keeps ~0.2 s of history, and a leftover byte is half a
+        # sample; either would otherwise bleed into the next session.
         self._boson_input_resampler = None
         self._boson_input_resampler_rates = None
+        self._boson_input_leftover = b""
+        self._boson_input_leftover_rate = None
         await self._close_active_response_frames()
         await self.stop_all_metrics()
         if websocket is not None:
@@ -721,6 +727,11 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         await self._truncate_current_audio_response()
         await self._mark_active_response_cancelled(send_cancel=True)
         await self.stop_all_metrics()
+
+    async def _replay_user_audio_preroll(self):
+        """Drop a leading half sample before replaying; Boson rejects odd appends."""
+        del self._user_audio_preroll_buffer[: len(self._user_audio_preroll_buffer) % 2]
+        await super()._replay_user_audio_preroll()
 
     async def _push_response_start_frame_if_needed(self) -> None:
         if self._boson_response_start_frame_active:
