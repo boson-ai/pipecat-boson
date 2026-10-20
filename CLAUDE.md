@@ -61,9 +61,12 @@ are two representations on purpose:
   the `_to_pipecat_*` helpers. Notably: server-VAD-disabled is `None` on the
   Boson wire but must be `False` for Pipecat's base turn-detection logic.
 
-When Pipecat pushes runtime setting changes (`_update_settings`), they are
-mirrored back into the `_boson_*` fields by `_sync_boson_settings_from_pipecat`,
-then a fresh `session.update` is sent. `_current_model` / `_current_instructions`
+When Pipecat pushes runtime setting changes (`_update_settings`), the update is
+first merged into Pipecat's stored `session_properties` (`_merge_model`), because
+Pipecat's `apply_update` replaces that field wholesale. Then
+`_sync_boson_settings_from_pipecat` mirrors only the fields the update set into
+the `_boson_*` fields, and a fresh `session.update` is sent; an update that
+changes nothing sends nothing. `_current_model` / `_current_instructions`
 / `_current_temperature` / `_current_tools` resolve "use the runtime override if
 given, else the constructed default."
 
@@ -96,6 +99,11 @@ logged as expected rather than surfaced as an error frame.
   (the base class appends one; `__init__` overwrites `base_url` afterward).
 - `response.create` payloads: `output_modalities` is rewritten to `modalities`
   by `_normalize_response_create_payload` before send.
+- Turn detection is fixed once the session starts: Boson rejects any later
+  change except `create_response` / `interrupt_response`, and that rejection is
+  fatal in `_handle_error_event`. While connected, `_sync_boson_settings_from_pipecat`
+  ignores turn-detection changes with a warning (the two flags have no effect yet).
+- A `turn_detection` payload without a `type` is server VAD on Boson.
 - `SimpleNamespace`-based attribute access (`_to_attr`) is used to read incoming
   JSON events uniformly.
 

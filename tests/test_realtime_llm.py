@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import (
     AggregatedTextFrame,
     Frame,
@@ -374,6 +375,11 @@ async def test_update_settings_can_clear_audio_input_transcription_and_noise_red
             session_properties=events.SessionProperties(audio=events.AudioConfiguration(input=events.AudioInput())),
         )
     )
+
+    # Nothing changed, so nothing is sent.
+    assert service.sent == []
+
+    await service._update_settings(service.Settings(session_properties=events.SessionProperties(tool_choice="none")))
 
     unchanged_input = service.sent[-1]["session"]["audio"]["input"]
     assert unchanged_input["transcription"] == {"model": "asr-v1"}
@@ -1237,6 +1243,108 @@ async def test_reply_transcript_is_reported_as_spoken_text():
     assert announced.text == spoken.text == "The capital is Rome."
 
 
+def session_with_turn_detection(turn_detection, **input_fields):
+    return events.SessionProperties(
+        audio=events.AudioConfiguration(input=events.AudioInput(turn_detection=turn_detection, **input_fields))
+    )
+
+
+def test_merge_model_overlays_only_the_fields_an_update_set():
+    current = events.SessionProperties(
+        tool_choice="none",
+        audio=events.AudioConfiguration(
+            input=events.AudioInput(
+                transcription=events.InputAudioTranscription(model="asr-v1"),
+                turn_detection=events.TurnDetection(threshold=0.6, silence_duration_ms=900),
+            )
+        ),
+    )
+
+    merged = realtime_llm._merge_model(current, session_with_turn_detection(events.TurnDetection(threshold=0.7)))
+
+    assert merged.tool_choice == "none"
+    assert merged.audio.input.transcription.model == "asr-v1"
+    assert merged.audio.input.turn_detection.threshold == 0.7
+    assert merged.audio.input.turn_detection.silence_duration_ms == 900
+    # The stored copy is left as it was.
+    assert current.audio.input.turn_detection.threshold == 0.6
+
+
+@pytest.mark.parametrize("replacement", [events.SemanticTurnDetection(), False])
+def test_merge_model_replaces_a_value_of_a_different_type(replacement):
+    current = session_with_turn_detection(events.TurnDetection(threshold=0.6, silence_duration_ms=900))
+
+    merged = realtime_llm._merge_model(current, session_with_turn_detection(replacement))
+
+    assert merged.audio.input.turn_detection == replacement
+
+
+def test_merge_model_clears_a_field_set_to_none():
+    current = session_with_turn_detection(
+        events.TurnDetection(threshold=0.6), transcription=events.InputAudioTranscription(model="asr-v1")
+    )
+    update = events.SessionProperties(audio=events.AudioConfiguration(input=events.AudioInput(transcription=None)))
+
+    merged = realtime_llm._merge_model(current, update)
+
+    assert merged.audio.input.transcription is None
+    assert merged.audio.input.turn_detection.threshold == 0.6
+
+
+def test_merge_model_replaces_tools_and_keeps_the_objects_as_given():
+    old_tools = ToolsSchema(standard_tools=[FunctionSchema("a", "a", {}, [])])
+    new_tools = ToolsSchema(standard_tools=[FunctionSchema("b", "b", {}, [])])
+
+    merged = realtime_llm._merge_model(
+        events.SessionProperties(tools=old_tools), events.SessionProperties(tools=new_tools)
+    )
+
+    assert merged.tools is new_tools
+
+
+@pytest.mark.asyncio
+async def test_unrelated_settings_update_keeps_pipecats_stored_session_properties():
+    tools = ToolsSchema(standard_tools=[FunctionSchema("weather", "weather", {}, [])])
+    service = CapturingBosonRealtimeLLMService(
+        tools=tools, output_modalities=["text"], input_audio_transcription={"model": "asr-v1"}
+    )
+
+    await service._update_settings(service.Settings(session_properties=events.SessionProperties(tool_choice="none")))
+
+    stored = service._settings.session_properties
+    assert stored.tool_choice == "none"
+    assert stored.tools is tools
+    assert stored.output_modalities == ["text"]
+    assert stored.audio.input.transcription.model == "asr-v1"
+    # Pipecat's own readers see the stored copy, not just Boson's.
+    assert service._is_modality_enabled("audio") is False
+
+
+@pytest.mark.asyncio
+async def test_settings_update_leaves_the_callers_delta_unchanged():
+    service = CapturingBosonRealtimeLLMService()
+    session_properties = events.SessionProperties(tool_choice="none")
+    delta = service.Settings(session_properties=session_properties)
+
+    await service._update_settings(delta)
+
+    # Pipecat forwards the frame carrying this delta to other services.
+    assert delta.session_properties is session_properties
+    assert session_properties.model_fields_set == {"tool_choice"}
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_update_wins_over_an_earlier_max_output_tokens_update():
+    service = CapturingBosonRealtimeLLMService()
+
+    await service._update_settings(
+        service.Settings(session_properties=events.SessionProperties(max_output_tokens=4096))
+    )
+    await service._update_settings(service.Settings(max_tokens=100))
+
+    assert service.sent[-1]["session"]["max_output_tokens"] == 100
+
+
 def make_turn_detection_delta(service, turn_detection):
     return service.Settings(
         session_properties=events.SessionProperties(
@@ -1498,3 +1606,158 @@ async def test_the_remembered_turn_detection_payload_is_not_aliased():
     await service._update_settings(make_turn_detection_delta(service, events.TurnDetection(threshold=0.7)))
 
     assert service._boson_turn_detection is not service._boson_last_enabled_turn_detection
+
+
+@pytest.mark.asyncio
+async def test_turn_detection_none_keeps_detection_rather_than_disabling_it():
+    # In Pipecat, None means "use the default detection"; only False opts out.
+    service = CapturingBosonRealtimeLLMService(turn_detection={"type": "server_vad", "threshold": 0.6})
+
+    await service._update_settings(make_turn_detection_delta(service, None))
+
+    assert sent_turn_detection(service) == {"type": "server_vad", "threshold": 0.6}
+    assert service._is_turn_detection_disabled() is False
+
+
+@pytest.mark.asyncio
+async def test_turn_detection_false_still_disables_detection():
+    service = CapturingBosonRealtimeLLMService(turn_detection={"type": "server_vad", "threshold": 0.6})
+
+    await service._update_settings(make_turn_detection_delta(service, False))
+
+    assert sent_turn_detection(service) is None
+    assert service._is_turn_detection_disabled() is True
+
+
+@pytest.mark.asyncio
+async def test_switching_to_semantic_vad_drops_untyped_server_vad_fields():
+    # Boson reads a payload without a type as server VAD.
+    service = CapturingBosonRealtimeLLMService(turn_detection={"threshold": 0.6, "silence_duration_ms": 900})
+
+    await service._update_settings(make_turn_detection_delta(service, events.SemanticTurnDetection()))
+
+    assert sent_turn_detection(service) == {"type": "semantic_vad"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "turn_detection", [events.TurnDetection(threshold=0.7), False, events.SemanticTurnDetection()]
+)
+async def test_turn_detection_is_fixed_once_the_session_has_started(monkeypatch, turn_detection):
+    # Boson rejects any turn-detection change after the first session.update, which goes out on connect.
+    warnings = []
+    monkeypatch.setattr(realtime_llm.logger, "warning", warnings.append)
+    service = CapturingBosonRealtimeLLMService(turn_detection={"type": "server_vad", "threshold": 0.6})
+    service._websocket = object()
+
+    await service._update_settings(make_turn_detection_delta(service, turn_detection))
+
+    assert sent_turn_detection(service) == {"type": "server_vad", "threshold": 0.6}
+    assert service._is_turn_detection_disabled() is False
+    assert len(warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_turn_detection_update_that_changes_nothing_is_quiet_mid_session(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(realtime_llm.logger, "warning", warnings.append)
+    service = CapturingBosonRealtimeLLMService(turn_detection={"type": "server_vad", "threshold": 0.6})
+    service._websocket = object()
+
+    await service._update_settings(make_turn_detection_delta(service, None))
+
+    assert sent_turn_detection(service) == {"type": "server_vad", "threshold": 0.6}
+    assert warnings == []
+
+
+@pytest.mark.asyncio
+async def test_turn_detection_can_change_again_after_a_disconnect():
+    # Each connection starts a new Boson session, which accepts any turn detection.
+    service = CapturingBosonRealtimeLLMService(turn_detection={"type": "server_vad", "threshold": 0.6})
+    service._websocket = object()
+    await service._update_settings(make_turn_detection_delta(service, events.TurnDetection(threshold=0.7)))
+    assert sent_turn_detection(service) == {"type": "server_vad", "threshold": 0.6}
+
+    await service._mark_websocket_disconnected()
+    await service._update_settings(make_turn_detection_delta(service, events.TurnDetection(threshold=0.7)))
+
+    assert service._boson_turn_detection == {"type": "server_vad", "threshold": 0.7}
+
+
+@pytest.mark.asyncio
+async def test_ignored_turn_detection_update_leaves_the_callers_delta_unchanged():
+    # With Pipecat's stored audio cleared, the merge replaces it with the update's own models.
+    service = CapturingBosonRealtimeLLMService(turn_detection={"type": "server_vad", "threshold": 0.6})
+    await service._update_settings(service.Settings(session_properties=events.SessionProperties(audio=None)))
+    service._websocket = object()
+    delta = make_turn_detection_delta(service, events.TurnDetection(threshold=0.7))
+
+    await service._update_settings(delta)
+
+    assert delta.session_properties.audio.input.turn_detection.threshold == 0.7
+
+
+async def other_tool(params, query: str = "") -> None:
+    """Search for something.
+
+    Args:
+        query: What to search for.
+    """
+
+
+def sent_tool_names(service):
+    return [tool["name"] for tool in service.sent[-1]["session"].get("tools") or []]
+
+
+def registered_tool_names(service):
+    return sorted(name for name in service._functions if name)
+
+
+@pytest.mark.asyncio
+async def test_tools_set_by_a_settings_update_survive_a_later_unrelated_update():
+    service = CapturingBosonRealtimeLLMService(tools=[weather_tool])
+
+    await service._update_settings(service.Settings(session_properties=events.SessionProperties(tools=[other_tool])))
+    assert sent_tool_names(service) == ["other_tool"]
+
+    await service._update_settings(service.Settings(session_properties=events.SessionProperties(tool_choice="none")))
+    assert service.sent[-1]["session"]["tool_choice"] == "none"
+    assert sent_tool_names(service) == ["other_tool"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("frame_tools", "expected"), [([other_tool], ["other_tool"]), ([], [])])
+async def test_handler_registry_follows_tools_set_by_frame(frame_tools, expected):
+    service = CapturingBosonRealtimeLLMService(tools=[weather_tool])
+    await service.process_frame(LLMSetToolsFrame(tools=frame_tools), FrameDirection.DOWNSTREAM)
+
+    # What Pipecat does on a context frame that carries no tools.
+    service._sync_registered_tool_handlers(None)
+
+    assert sent_tool_names(service) == expected
+    assert registered_tool_names(service) == expected
+
+
+@pytest.mark.asyncio
+async def test_wire_and_handler_registry_agree_across_a_sequence_of_updates():
+    # Whatever Boson is offered must have a handler, through every way tools can change.
+    service = CapturingBosonRealtimeLLMService(tools=[weather_tool])
+
+    async def agree():
+        await service._send_session_update()
+        service._sync_registered_tool_handlers(None)
+        return sent_tool_names(service) == registered_tool_names(service)
+
+    assert await agree()
+
+    await service._update_settings(service.Settings(session_properties=events.SessionProperties(tools=[other_tool])))
+    assert await agree()
+
+    await service._update_settings(service.Settings(system_instruction="unrelated"))
+    assert await agree()
+
+    await service.process_frame(LLMSetToolsFrame(tools=[weather_tool]), FrameDirection.DOWNSTREAM)
+    assert await agree()
+
+    await service._update_settings(service.Settings(session_properties=events.SessionProperties(tool_choice="none")))
+    assert await agree()
