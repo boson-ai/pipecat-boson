@@ -51,7 +51,7 @@ jobs:
       matrix:
         # Older Pipecat versions we still promise to support.
         # The newest Pipecat is tested by the `test` job above,
-        # which always installs the latest release automatically.
+        # which installs the latest release the version range allows.
         #   1.4.0 = oldest supported version
         #   1.7.0 = last version with assert_given in its old location
         #   1.8.0 = first version with assert_given in its new location

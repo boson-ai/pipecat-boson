@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+- Require `pipecat-ai` below 1.13. Pipecat 1.13 changed the realtime service this package builds on, and this package does not work with it yet. Installing the package now selects Pipecat 1.12 or older.
+
 ### Fixed
 
 - Report the reply transcript as text that is being spoken. RTVI 2 clients, such as the Pipecat playground (prebuilt 1.13) and the voice UI kit, showed every assistant message empty because the text arrived as unspoken.
