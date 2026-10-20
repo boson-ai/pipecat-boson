@@ -16,6 +16,7 @@ from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import (
     AggregatedTextFrame,
     Frame,
+    InterimTranscriptionFrame,
     LLMConfigureOutputFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -37,6 +38,7 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.openai.realtime import events
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.utils.text.base_text_aggregator import AggregationType
+from pipecat.utils.time import time_now_iso8601
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
@@ -678,6 +680,19 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         if item_id and not self._mark_transcription_item_completed(item_id):
             return
         await super().handle_evt_input_audio_transcription_completed(evt)
+
+    async def _handle_evt_speech_stopped(self, evt) -> None:
+        """Mark the caller's turn as soon as the server ends it.
+
+        The server's transcript of a turn can arrive after the reply to it has
+        started, so clients that order the conversation by arrival (the Pipecat
+        playground) put the caller's words under the reply. An empty interim
+        transcript now opens the caller's turn first; the final transcript then
+        fills it in.
+        """
+        await super()._handle_evt_speech_stopped(evt)
+        if self.user_transcription_enabled:
+            await self.push_frame(InterimTranscriptionFrame("", "", time_now_iso8601()), FrameDirection.UPSTREAM)
 
     async def _handle_evt_input_audio_transcription_failed(self, evt) -> None:
         error = getattr(evt, "error", None)
