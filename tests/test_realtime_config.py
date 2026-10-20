@@ -4,6 +4,8 @@ from __future__ import annotations
 import pytest
 
 from pipecat_boson.realtime.config import (
+    SAMPLE_RATE,
+    SUPPORTED_PCM_RATES,
     UNSET,
     build_input_audio_transcription,
     build_noise_reduction,
@@ -13,6 +15,8 @@ from pipecat_boson.realtime.config import (
     normalize_max_output_tokens,
     normalize_ws_url,
     resolve_output_modalities,
+    resolve_pcm_rate,
+    split_whole_samples,
 )
 
 
@@ -162,3 +166,64 @@ def test_build_session_update_payload_can_omit_or_clear_noise_reduction():
 
     assert "noise_reduction" not in omitted["session"]["audio"]["input"]
     assert cleared["session"]["audio"]["input"]["noise_reduction"] is None
+
+
+def test_resolve_pcm_rate_keeps_supported_rates_and_falls_back_otherwise():
+    for rate in SUPPORTED_PCM_RATES:
+        assert resolve_pcm_rate(rate) == rate
+    for rate in (None, 0, 11025, 22050, 44100, 96000):
+        assert resolve_pcm_rate(rate) == SAMPLE_RATE
+
+
+def test_split_whole_samples_carries_a_split_sample_into_the_next_chunk():
+    # Each byte pair is one 16-bit sample: b"a1b1" is two samples, b"a1b" ends halfway through one.
+    assert split_whole_samples(b"", b"a1b1") == (b"a1b1", b"")
+    assert split_whole_samples(b"", b"a1b") == (b"a1", b"b")
+    assert split_whole_samples(b"b", b"1c1") == (b"b1c1", b"")
+    assert split_whole_samples(b"b", b"1c") == (b"b1", b"c")
+    assert split_whole_samples(b"", b"a") == (b"", b"a")
+
+
+def test_build_session_update_payload_carries_configured_sample_rates():
+    payload = build_session_update_payload(
+        event_id="evt_rates",
+        model="higgs-realtime",
+        voice="default",
+        instructions="Be brief.",
+        output_modalities=["audio"],
+        temperature=None,
+        max_output_tokens="inf",
+        tool_choice="auto",
+        tools=None,
+        speed=1.0,
+        turn_detection={"type": "server_vad"},
+        input_audio_transcription=UNSET,
+        input_audio_noise_reduction=UNSET,
+        input_sample_rate=16000,
+    )
+
+    audio = payload["session"]["audio"]
+    assert audio["input"]["format"] == {"type": "audio/pcm", "rate": 16000}
+    assert audio["output"]["format"] == {"type": "audio/pcm", "rate": SAMPLE_RATE}
+
+
+def test_build_session_update_payload_defaults_both_sample_rates_to_24k():
+    payload = build_session_update_payload(
+        event_id="evt_default_rates",
+        model="higgs-realtime",
+        voice="default",
+        instructions="Be brief.",
+        output_modalities=["audio"],
+        temperature=None,
+        max_output_tokens="inf",
+        tool_choice="auto",
+        tools=None,
+        speed=1.0,
+        turn_detection={"type": "server_vad"},
+        input_audio_transcription=UNSET,
+        input_audio_noise_reduction=UNSET,
+    )
+
+    audio = payload["session"]["audio"]
+    assert audio["input"]["format"]["rate"] == SAMPLE_RATE
+    assert audio["output"]["format"]["rate"] == SAMPLE_RATE
