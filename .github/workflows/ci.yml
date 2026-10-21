@@ -55,7 +55,8 @@ jobs:
         #   1.4.0 = oldest supported version
         #   1.7.0 = last version with assert_given in its old location
         #   1.8.0 = first version with assert_given in its new location
-        pipecat-version: ["1.4.0", "1.7.0", "1.8.0"]
+        #   1.12.0 = last version before the 1.13 API changes (see _compat.py)
+        pipecat-version: ["1.4.0", "1.7.0", "1.8.0", "1.12.0"]
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7

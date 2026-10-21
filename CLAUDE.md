@@ -35,7 +35,7 @@ config), so new async tests must carry the marker.
 
 ## Architecture
 
-The whole package is two source modules under `pipecat_boson/realtime/`:
+The whole package is three source modules under `pipecat_boson/realtime/`:
 
 - **`config.py`** — pure, side-effect-free helpers that build Boson wire
   payloads and validate options. No Pipecat/websocket imports. This is where the
@@ -48,6 +48,12 @@ The whole package is two source modules under `pipecat_boson/realtime/`:
 
 - **`llm.py`** — `BosonRealtimeLLMService`, which subclasses Pipecat's
   `OpenAIRealtimeLLMService` and adapts it to Boson's protocol variations.
+
+- **`_compat.py`** — the differences between the supported Pipecat versions,
+  each detected once at import from Pipecat itself (a signature, an import,
+  whether a call is async) rather than from a version number. `llm.py` imports
+  these names instead of branching on a version; put any new version difference
+  here.
 
 ### The key adaptation pattern in `llm.py`
 
@@ -98,6 +104,10 @@ logged as expected rather than surfaced as an error frame.
   by `_normalize_response_create_payload` before send.
 - `SimpleNamespace`-based attribute access (`_to_attr`) is used to read incoming
   JSON events uniformly.
+- Boson accepts only `user` and `assistant` message items from a client and rejects
+  `system` with a 400, which `_handle_error_event` treats as fatal. Pipecat 1.13 sends
+  a tool's progress updates as system items, so `_handle_function_call_result` drops
+  them (`accepts_intermediate_function_call_results` is `False`).
 
 ## Conventions
 
@@ -106,8 +116,8 @@ logged as expected rather than surfaced as an error frame.
 - Public entry point is `from pipecat_boson.realtime import BosonRealtimeLLMService`;
   it is lazily imported via `__getattr__` in `realtime/__init__.py` so importing
   the package doesn't pull Pipecat until the service is actually used.
-- Targets `pipecat-ai>=1.4.0,<1.13` (capped until the Pipecat 1.13 API changes are handled) and Python 3.11+. CI tests the newest Pipecat plus
+- Targets `pipecat-ai>=1.4.0,<2` and Python 3.11+. CI tests the newest Pipecat plus
   the older versions listed in the `compat` job in `.github/workflows/ci.yml`.
-- `assert_given` and `is_given` are imported with a `try`/`except` in `llm.py`
-  because Pipecat 1.8.0 moved them. Keep the fallback while the minimum supported
-  Pipecat is below 1.8.0.
+- `_compat.py` keeps one fallback per Pipecat version difference, such as
+  `assert_given` / `is_given`, which Pipecat 1.8.0 moved. Remove a fallback once
+  the minimum supported Pipecat no longer needs it.
