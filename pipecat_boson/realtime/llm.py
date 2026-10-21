@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import uuid
 from collections import deque
@@ -39,10 +40,13 @@ from pipecat.services.openai.realtime import events
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.utils.text.base_text_aggregator import AggregationType
 from pipecat.utils.time import time_now_iso8601
+from pydantic import BaseModel
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
 from .config import (
+    DEFAULT_TURN_DETECTION,
+    SUPPORTED_SEMANTIC_EAGERNESS,
     UNSET,
     build_input_audio_transcription,
     build_noise_reduction,
@@ -251,6 +255,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         self._boson_tool_choice = tool_choice
         self._boson_speed = speed
         self._boson_turn_detection = turn_detection_config
+        self._boson_last_enabled_turn_detection = turn_detection_config
         self._boson_input_audio_transcription = transcription_config
         self._boson_input_audio_noise_reduction = noise_reduction_config
         self._boson_truncation = truncation
@@ -288,6 +293,15 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         """Whether this service is configured to emit realtime audio output frames."""
 
         return "audio" in self._boson_output_modalities
+
+    def _is_turn_detection_disabled(self) -> bool:
+        """Whether the application, rather than Boson, drives turn taking.
+
+        Read from the Boson payload: a settings update replaces Pipecat's copy
+        wholesale, which would flip this answer without Boson being told.
+        """
+
+        return self._boson_turn_detection is None
 
     async def _connect(self):
         try:
@@ -427,8 +441,9 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
 
     async def _send_session_update(self):
         instructions = self._current_instructions()
+        # _current_tools already prefers runtime tools; the flag only decides whether the context may override.
         runtime_tools_set = self._boson_runtime_tools is not UNSET
-        tools = self._tools_from_value(self._boson_runtime_tools) if runtime_tools_set else self._current_tools()
+        tools = self._current_tools()
 
         if self._context:
             adapter = self.get_llm_adapter()
@@ -461,10 +476,15 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         await self.send_client_event(payload)
 
     async def _update_settings(self, delta):
+        update = delta.session_properties
+        if is_given(update):
+            # Pipecat's apply_update replaces session_properties wholesale; merge so unmentioned fields survive.
+            delta = copy.copy(delta)
+            delta.session_properties = _merge_model(assert_given(self._settings.session_properties), update)
         changed = await super(OpenAIRealtimeLLMService, self)._update_settings(delta)
         handled = {"model", "session_properties", "system_instruction", "temperature", "max_tokens"}
         if changed.keys() & handled:
-            self._sync_boson_settings_from_pipecat()
+            self._sync_boson_settings_from_pipecat(update if is_given(update) else None)
             await self._send_session_update()
         self._warn_unhandled_updated_settings(changed.keys() - handled)
         return changed
@@ -944,9 +964,19 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             return self._settings.temperature
         return self._boson_temperature
 
+    def _service_tools(self) -> ToolsSchema | list[Any] | None:
+        """Tools Pipecat registers handlers for.
+
+        Same precedence as the wire payload, so the handler registry and the
+        tools Boson is offered agree.
+        """
+
+        if self._boson_runtime_tools is not UNSET:
+            return self._boson_runtime_tools
+        return assert_given(self._settings.session_properties).tools
+
     def _current_tools(self) -> list[dict[str, Any]]:
-        session_properties = assert_given(self._settings.session_properties)
-        return self._tools_from_value(session_properties.tools)
+        return self._tools_from_value(self._service_tools())
 
     def _tools_from_value(self, tools: Any) -> list[dict[str, Any]]:
         if tools is None or not is_given(tools) or not is_context_value_given(tools):
@@ -958,13 +988,14 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             return adapter.from_standard_tools(ToolsSchema(standard_tools=tools)) or []
         return [_dump_tool(tool) for tool in tools]
 
-    def _sync_boson_settings_from_pipecat(self) -> None:
-        session_properties = assert_given(self._settings.session_properties)
+    def _sync_boson_settings_from_pipecat(self, session_properties: events.SessionProperties | None) -> None:
         self._boson_model = self._current_model()
         self._boson_instructions = self._current_instructions()
         self._boson_temperature = self._current_temperature()
         if is_given(self._settings.max_tokens):
             self._boson_max_output_tokens = self._settings.max_tokens or "inf"
+        if session_properties is None:
+            return
         if session_properties.output_modalities:
             self._boson_output_modalities = resolve_output_modalities(session_properties.output_modalities)
         if session_properties.tool_choice is not None:
@@ -980,9 +1011,25 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         if session_properties.audio and session_properties.audio.input:
             audio_input = session_properties.audio.input
             if _field_was_set(audio_input, "turn_detection"):
-                self._boson_turn_detection = (
-                    None if audio_input.turn_detection is False else _dump_model(audio_input.turn_detection)
+                merged = _drop_unsupported_eagerness(
+                    _merge_turn_detection(
+                        self._boson_turn_detection or self._boson_last_enabled_turn_detection,
+                        audio_input.turn_detection,
+                    )
                 )
+                if self._websocket is not None and merged != self._boson_turn_detection:
+                    # Connecting sends the first session.update, and Boson rejects later turn-detection changes.
+                    logger.warning(
+                        "Boson fixes turn detection when the session starts; ignoring this turn-detection update."
+                    )
+                    merged = self._boson_turn_detection
+                    # Keep Pipecat's copy in step too, or repeating this request would look like no change.
+                    stored_input = assert_given(self._settings.session_properties).audio.input
+                    stored_input.turn_detection = _to_pipecat_turn_detection(merged)
+                if merged is not None:
+                    # A copy: the live payload must not alias what we remember.
+                    self._boson_last_enabled_turn_detection = dict(merged)
+                self._boson_turn_detection = merged
             if _field_was_set(audio_input, "transcription"):
                 transcription = _dump_model(audio_input.transcription)
                 self._boson_input_audio_transcription = (
@@ -992,6 +1039,98 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
                 )
             if _field_was_set(audio_input, "noise_reduction"):
                 self._boson_input_audio_noise_reduction = _dump_model(audio_input.noise_reduction)
+
+
+def _merge_model(current: BaseModel, update: BaseModel) -> BaseModel:
+    """``current`` with the fields ``update`` set laid over it.
+
+    Nested models of the same type merge field by field; anything else, such as a
+    list or a different VAD type, replaces the stored value.
+    """
+
+    changes = {}
+    for name in update.model_fields_set:
+        value = getattr(update, name)
+        stored = getattr(current, name, None)
+        if isinstance(value, BaseModel):
+            value = _merge_model(stored, value) if type(value) is type(stored) else value.model_copy(deep=True)
+        changes[name] = value
+    return current.model_copy(update=changes)
+
+
+def _drop_unsupported_eagerness(turn_detection: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Strip an eagerness value Boson would refuse.
+
+    Boson accepts only ``"auto"`` and ends the session otherwise. Construction
+    rejects a bad value; dropping it here keeps a live session alive.
+    """
+
+    if not isinstance(turn_detection, dict):
+        return turn_detection
+    eagerness = turn_detection.get("eagerness")
+    if eagerness is None or eagerness in SUPPORTED_SEMANTIC_EAGERNESS:
+        return turn_detection
+    logger.warning(
+        f"Boson realtime API accepts only eagerness={SUPPORTED_SEMANTIC_EAGERNESS[0]!r}; "
+        f"dropping eagerness={eagerness!r} from the turn detection update."
+    )
+    sanitized = dict(turn_detection)
+    sanitized.pop("eagerness")
+    return sanitized
+
+
+def _turn_detection_fields(value: Any) -> dict[str, Any]:
+    """The turn-detection fields a caller actually set, type excluded.
+
+    ``exclude_unset`` stops Pipecat's model defaults overwriting values the caller
+    never mentioned; this service's own model passes absent fields as None.
+    """
+
+    if hasattr(value, "model_dump"):
+        dumped = value.model_dump(exclude_unset=True)
+    elif isinstance(value, dict):
+        dumped = dict(value)
+    else:
+        return {}
+    return {name: field for name, field in dumped.items() if field is not None and name != "type"}
+
+
+def _turn_detection_type(value: Any) -> str | None:
+    """The VAD type a value implies, which its dump may omit."""
+
+    if isinstance(value, events.SemanticTurnDetection):
+        return "semantic_vad"
+    if isinstance(value, events.TurnDetection):
+        return "server_vad"
+    if isinstance(value, dict):
+        return value.get("type")
+    return getattr(value, "type", None)
+
+
+def _merge_turn_detection(current: dict[str, Any] | None, value: Any) -> dict[str, Any] | None:
+    """Overlay the fields a caller set onto the Boson payload.
+
+    Pipecat's models cannot express every field Boson accepts, so replacing the
+    payload would drop them on every settings update.
+    """
+
+    if value is False:
+        return None
+    if value is None or value is True:
+        # Only False opts out (Pipecat's convention); None and True re-enable the last configuration.
+        return dict(current) if isinstance(current, dict) else dict(DEFAULT_TURN_DETECTION)
+    fields = _turn_detection_fields(value)
+    vad_type = _turn_detection_type(value)
+    # Boson reads a missing type as server VAD.
+    current_type = (current.get("type") or "server_vad") if isinstance(current, dict) else None
+    if not isinstance(current, dict) or (vad_type and current_type != vad_type):
+        # A different VAD type shares no fields: start fresh.
+        return {**({"type": vad_type} if vad_type else {}), **fields}
+    merged = dict(current)
+    merged.update(fields)
+    if vad_type:
+        merged["type"] = vad_type
+    return merged
 
 
 def _loads_ws_message(message: Any) -> dict[str, Any]:
