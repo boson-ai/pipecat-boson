@@ -13,6 +13,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- Leave tool calls marked `executor: "server"` to the server. Server tools such as `web_search` arrive as ordinary `function_call` items; the service tracked them as calls to run locally and could answer a call the server had already answered. The server runs them and adds the output; the result is spoken in the next turn or in a reply the server starts after a pause.
 - Cap `pipecat-ai` below 1.13. Pipecat 1.13.0 added a `direction` argument to `OpenAIRealtimeLLMService._handle_context` and made `get_llm_invocation_params` async, which broke the service on the first context frame and when sending conversation messages.
 - Report the reply transcript as text that is being spoken. RTVI 2 clients, such as the Pipecat playground (prebuilt 1.13) and the voice UI kit, showed every assistant message empty because the text arrived as unspoken.
 - Import correctly on `pipecat-ai` 1.8.0 and newer, which moved `assert_given` from `pipecat.services.settings` to `pipecat.utils.types`. The package previously failed to import on those versions. Older supported versions continue to work.
