@@ -13,6 +13,7 @@ from pipecat.frames.frames import (
     Frame,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
+    InterimTranscriptionFrame,
     InterruptionFrame,
     LLMConfigureOutputFrame,
     LLMContextFrame,
@@ -1289,3 +1290,24 @@ async def test_client_executed_tool_calls_are_still_tracked():
     )
 
     assert "call_client" in service._pending_function_calls
+
+
+@pytest.mark.asyncio
+async def test_speech_stopped_opens_the_callers_turn_before_the_reply():
+    # The server's transcript of a turn can arrive after the reply starts. An
+    # empty interim transcript at speech_stopped lets clients place the turn first.
+    service = CapturingBosonRealtimeLLMService(input_audio_transcription_model="higgs-stt-3.1")
+
+    await service._handle_evt_speech_stopped(SimpleNamespace(type="input_audio_buffer.speech_stopped"))
+
+    interim = [f for f in service.pushed if isinstance(f, InterimTranscriptionFrame)]
+    assert len(interim) == 1 and interim[0].text == ""
+
+
+@pytest.mark.asyncio
+async def test_speech_stopped_sends_no_interim_transcript_without_transcription():
+    service = CapturingBosonRealtimeLLMService()
+
+    await service._handle_evt_speech_stopped(SimpleNamespace(type="input_audio_buffer.speech_stopped"))
+
+    assert not [f for f in service.pushed if isinstance(f, InterimTranscriptionFrame)]
