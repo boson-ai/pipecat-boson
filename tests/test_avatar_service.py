@@ -395,6 +395,23 @@ async def test_pipeline_speaks_through_avatar_and_truncates_at_its_playback(avat
 
 
 @pytest.mark.asyncio
+async def test_session_started_event_reports_the_session_id(avatar_api):
+    avatar = make_avatar(avatar_api)
+    started = []
+
+    @avatar.event_handler("on_session_started")
+    async def on_session_started(service, session_id):
+        started.append((service, session_id))
+
+    await avatar._open()
+    try:
+        await eventually(lambda: started)
+        assert started == [(avatar, "s1")]
+    finally:
+        await avatar._close()
+
+
+@pytest.mark.asyncio
 async def test_rejected_session_creation_raises_api_error(avatar_api):
     avatar_api.create_status = 503
     avatar = make_avatar(avatar_api)

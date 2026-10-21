@@ -355,6 +355,10 @@ and open the printed page:
 uv run --extra daily python examples/pipecat_boson_avatar_daily.py
 ```
 
+With `--serve`, the example is instead a bot launcher for your own web page.
+`POST /sessions` starts a bot in a new room and returns the room URL and a
+viewer token once the avatar is in the room.
+
 ## Supported Higgs Realtime options
 
 Connection options:

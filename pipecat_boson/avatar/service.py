@@ -145,8 +145,9 @@ class BosonAvatarService(AvatarAudioOutput):
     """A Boson Avatar participant that speaks the bot's audio in the call.
 
     On ``StartFrame`` it creates an Avatar session in ``room`` and connects the
-    session's audio channel. ``EndFrame`` or ``CancelFrame`` ends the session.
-    If the avatar ends the session first, the processor pushes a fatal error.
+    session's audio channel, then emits ``on_session_started(service,
+    session_id)``. ``EndFrame`` or ``CancelFrame`` ends the session. If the
+    avatar ends the session first, the processor pushes a fatal error.
     """
 
     def __init__(
@@ -195,6 +196,7 @@ class BosonAvatarService(AvatarAudioOutput):
         self._session_id: str | None = None
         self._closing = False
         self._ended_task: asyncio.Task | None = None
+        self._register_event_handler("on_session_started")
 
     @property
     def session_id(self) -> str | None:
@@ -217,6 +219,7 @@ class BosonAvatarService(AvatarAudioOutput):
             raise
         self._socket.reader.add_done_callback(self._audio_channel_closed)
         logger.info(f"{self}: Avatar session {self._session_id} started")
+        await self._call_event_handler("on_session_started", self._session_id)
 
     def _audio_channel_closed(self, task: asyncio.Task) -> None:
         if self._closing or task.cancelled():
