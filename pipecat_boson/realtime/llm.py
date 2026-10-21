@@ -295,6 +295,8 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
                 return
 
             self._boson_terminal_session_event_type = None
+            # call_ids belong to one session; a new connection starts with none.
+            self._boson_server_call_ids.clear()
             headers = {"User-Agent": "Pipecat Boson realtime service"}
             if self.api_key:
                 headers["Authorization"] = f"Bearer {self.api_key}"
@@ -587,7 +589,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             if asyncio.iscoroutine(result):
                 await result
         elif event_type == "response.output_item.added":
-            self._track_function_call_item(event)
+            self._track_function_call(_to_attr(event.get("item") or {}))
         elif event_type == "error":
             return await self._handle_error_event(evt)
         elif event_type in _BOSON_TERMINAL_SESSION_EVENT_TYPES:
@@ -617,10 +619,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         item = evt.item
         item_id = getattr(item, "id", None)
 
-        if getattr(item, "type", None) == "function_call" and not self._is_server_executed(item):
-            call_id = getattr(item, "call_id", None)
-            if call_id and call_id not in self._pending_function_calls:
-                self._pending_function_calls[call_id] = item
+        self._track_function_call(item)
 
         if item_id:
             await self._call_event_handler("on_conversation_item_created", item_id, item)
@@ -902,33 +901,28 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             return True
         return False
 
-    def _track_function_call_item(self, event: dict[str, Any]) -> None:
-        item = event.get("item") or {}
-        if item.get("type") != "function_call" or self._is_server_executed(item):
-            return
-        call_id = item.get("call_id")
-        if not call_id or call_id in self._pending_function_calls:
-            return
-        self._pending_function_calls[call_id] = _to_attr(item)
-
-    def _is_server_executed(self, item: Any) -> bool:
-        """Whether a function_call item is one the server runs itself.
+    def _track_function_call(self, item: Any) -> None:
+        """Track a function_call item as a call to run here, unless the server runs it.
 
         Server tools (``{"type": "web_search"}``) show up as ordinary
         ``function_call`` items with ``executor: "server"``. The server runs
         them and adds the ``function_call_output`` itself; the result is spoken
         in the next turn, or in a reply the server starts after a pause. A
-        client must not run them, answer them or request a response.
+        client must not run them, answer them or request a response. Either
+        item event may carry the executor, so a call once marked stays the
+        server's and leaves the pending calls.
         """
-        executor = item.get("executor") if isinstance(item, dict) else getattr(item, "executor", None)
-        if executor != "server":
-            return False
-        call_id = item.get("call_id") if isinstance(item, dict) else getattr(item, "call_id", None)
-        if call_id and call_id not in self._boson_server_call_ids:
-            self._boson_server_call_ids.append(call_id)
-            name = item.get("name") if isinstance(item, dict) else getattr(item, "name", None)
-            logger.debug(f"Server is running tool {name!r} (call_id={call_id}); not running it here")
-        return True
+        if getattr(item, "type", None) != "function_call":
+            return
+        call_id = getattr(item, "call_id", None)
+        if getattr(item, "executor", None) == "server" or call_id in self._boson_server_call_ids:
+            if call_id and call_id not in self._boson_server_call_ids:
+                self._boson_server_call_ids.append(call_id)
+                logger.debug(f"Server is running tool {getattr(item, 'name', None)!r} (call_id={call_id})")
+            self._pending_function_calls.pop(call_id, None)
+            return
+        if call_id and call_id not in self._pending_function_calls:
+            self._pending_function_calls[call_id] = item
 
     async def _handle_evt_function_call_arguments_done(self, evt):
         if getattr(evt, "call_id", None) in self._boson_server_call_ids:

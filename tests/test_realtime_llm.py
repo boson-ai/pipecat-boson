@@ -1292,6 +1292,86 @@ async def test_client_executed_tool_calls_are_still_tracked():
     assert "call_client" in service._pending_function_calls
 
 
+def _dispatch_recorder(service):
+    dispatched = []
+
+    async def run_function_calls(function_calls):
+        dispatched.extend(call.function_name for call in function_calls)
+
+    service.run_function_calls = run_function_calls
+    return dispatched
+
+
+@pytest.mark.asyncio
+async def test_client_executed_tool_calls_are_dispatched():
+    service = CapturingBosonRealtimeLLMService()
+    service._context = LLMContext([])
+    dispatched = _dispatch_recorder(service)
+    item = {
+        "id": "item_2",
+        "type": "function_call",
+        "name": "get_time",
+        "call_id": "call_client",
+        "executor": "client",
+    }
+
+    await service._dispatch_boson_server_event({"type": "conversation.item.added", "item": item})
+    await service._dispatch_boson_server_event(
+        {"type": "response.function_call_arguments.done", "call_id": "call_client", "arguments": "{}"}
+    )
+
+    assert dispatched == ["get_time"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marked_first", [True, False])
+async def test_a_call_marked_server_by_either_item_event_is_not_dispatched(marked_first):
+    # The executor may sit on only one of the two item events, in either order.
+    service = CapturingBosonRealtimeLLMService()
+    service._context = LLMContext([])
+    dispatched = _dispatch_recorder(service)
+    marked = {"id": "item_1", "type": "function_call", "name": "web_search", "call_id": "call_s", "executor": "server"}
+    unmarked = {key: value for key, value in marked.items() if key != "executor"}
+    events = [
+        {"type": "response.output_item.added", "response_id": "r", "item": marked},
+        {"type": "conversation.item.added", "item": unmarked},
+    ]
+    for event in events if marked_first else events[::-1]:
+        await service._dispatch_boson_server_event(event)
+    await service._dispatch_boson_server_event(
+        {"type": "response.function_call_arguments.done", "call_id": "call_s", "arguments": "{}"}
+    )
+
+    assert "call_s" not in service._pending_function_calls
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_server_call_ids_are_forgotten_on_a_new_connection(monkeypatch):
+    service = CapturingBosonRealtimeLLMService()
+    await service._dispatch_boson_server_event(
+        {
+            "type": "conversation.item.added",
+            "item": {"id": "i", "type": "function_call", "name": "web_search", "call_id": "c", "executor": "server"},
+        }
+    )
+    assert "c" in service._boson_server_call_ids
+
+    async def fake_connect(**kwargs):
+        return object()
+
+    async def no_session_update():
+        return None
+
+    monkeypatch.setattr("pipecat_boson.realtime.llm.websocket_connect", fake_connect)
+    monkeypatch.setattr(service, "create_task", lambda coroutine: coroutine.close())
+    monkeypatch.setattr(service, "_send_session_update", no_session_update)
+    service._websocket = None
+    await service._connect()
+
+    assert "c" not in service._boson_server_call_ids
+
+
 @pytest.mark.asyncio
 async def test_speech_stopped_opens_the_callers_turn_before_the_reply():
     # The server's transcript of a turn can arrive after the reply starts. An
