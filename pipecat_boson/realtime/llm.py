@@ -589,7 +589,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             if asyncio.iscoroutine(result):
                 await result
         elif event_type == "response.output_item.added":
-            self._track_function_call(_to_attr(event.get("item") or {}))
+            self._track_function_call(getattr(evt, "item", None))
         elif event_type == "error":
             return await self._handle_error_event(evt)
         elif event_type in _BOSON_TERMINAL_SESSION_EVENT_TYPES:

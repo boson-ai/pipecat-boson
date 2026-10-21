@@ -1324,8 +1324,9 @@ async def test_client_executed_tool_calls_are_dispatched():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("marked_first", [True, False])
-async def test_a_call_marked_server_by_either_item_event_is_not_dispatched(marked_first):
+@pytest.mark.parametrize("marked_on_output_item", [True, False])
+@pytest.mark.parametrize("output_item_first", [True, False])
+async def test_a_call_marked_server_by_either_item_event_is_not_dispatched(marked_on_output_item, output_item_first):
     # The executor may sit on only one of the two item events, in either order.
     service = CapturingBosonRealtimeLLMService()
     service._context = LLMContext([])
@@ -1333,10 +1334,14 @@ async def test_a_call_marked_server_by_either_item_event_is_not_dispatched(marke
     marked = {"id": "item_1", "type": "function_call", "name": "web_search", "call_id": "call_s", "executor": "server"}
     unmarked = {key: value for key, value in marked.items() if key != "executor"}
     events = [
-        {"type": "response.output_item.added", "response_id": "r", "item": marked},
-        {"type": "conversation.item.added", "item": unmarked},
+        {
+            "type": "response.output_item.added",
+            "response_id": "r",
+            "item": marked if marked_on_output_item else unmarked,
+        },
+        {"type": "conversation.item.added", "item": unmarked if marked_on_output_item else marked},
     ]
-    for event in events if marked_first else events[::-1]:
+    for event in events if output_item_first else events[::-1]:
         await service._dispatch_boson_server_event(event)
     await service._dispatch_boson_server_event(
         {"type": "response.function_call_arguments.done", "call_id": "call_s", "arguments": "{}"}
