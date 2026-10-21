@@ -35,7 +35,7 @@ config), so new async tests must carry the marker.
 
 ## Architecture
 
-The whole package is two source modules under `pipecat_boson/realtime/`:
+The realtime service is two source modules under `pipecat_boson/realtime/`:
 
 - **`config.py`** — pure, side-effect-free helpers that build Boson wire
   payloads and validate options. No Pipecat/websocket imports. This is where the
@@ -98,6 +98,23 @@ logged as expected rather than surfaced as an error frame.
   by `_normalize_response_create_payload` before send.
 - `SimpleNamespace`-based attribute access (`_to_attr`) is used to read incoming
   JSON events uniformly.
+
+### Avatar output (`pipecat_boson/avatar/`)
+
+- **`playback.py`** — `AvatarPlayback`, a Pipecat-free ledger that keeps each
+  reply's generated, delivered and played audio apart until the avatar's
+  playback receipt arrives. Its channel is injected (open/write/end a reply,
+  clear, receipts), so tests use an in-memory channel.
+- **`api.py`** — the Avatar session API client (`POST`/`DELETE /sessions`, one
+  resource for every room provider via `transport.type`) and the per-session
+  audio WebSocket channel. The module docstring is the wire reference.
+- **`service.py`** — `AvatarAudioOutput` (frame handling over any channel) and
+  `BosonAvatarService` (adds the Daily session lifecycle).
+
+`BosonRealtimeLLMService(audio_playback=...)` is the only coupling: the service
+reports each generated audio frame's response/item identity through
+`track_audio` and delegates interruption truncation to `interrupt()`. Keep
+playback state in the avatar package rather than in the realtime service.
 
 ## Conventions
 

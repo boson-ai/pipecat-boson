@@ -26,6 +26,10 @@ webrtc = [
     "pipecat-ai[runner,webrtc]>=1.4.0,<1.13",
     "python-dotenv>=1.0.0,<2",
 ]
+daily = [
+    "pipecat-ai[daily]>=1.4.0,<1.13",
+    "python-dotenv>=1.0.0,<2",
+]
 test = [
     "pytest==8.4.2",
     "pytest-asyncio==1.2.0",

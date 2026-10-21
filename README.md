@@ -300,6 +300,61 @@ transport automatically.
 Keep `on_session_created` handlers fast. Session setup waits for this handler
 to return.
 
+## Add a Boson Avatar
+
+`BosonAvatarService` renders the bot's speech as a talking avatar. The avatar
+joins your Daily room as its own participant and publishes the reply as
+synchronized audio and video, so the bot must not publish the audio as well.
+
+```python
+from pipecat_boson.avatar import BosonAvatarService, DailyAvatarRoom
+
+avatar = BosonAvatarService(
+    api_url=os.environ["BOSON_AVATAR_API_URL"],
+    api_key=os.environ["BOSON_API_KEY"],
+    avatar_id=os.environ["BOSON_AVATAR_ID"],
+    room=DailyAvatarRoom(url=room_url, token=avatar_token, identity="boson-avatar"),
+)
+llm = BosonRealtimeLLMService(..., audio_playback=avatar)
+
+transport = DailyTransport(
+    room_url,
+    bot_token,
+    "Bot",
+    DailyParams(
+        audio_in_enabled=True,
+        audio_out_enabled=False,
+        microphone_out_enabled=False,
+        camera_out_enabled=False,
+    ),
+)
+pipeline = Pipeline(
+    [transport.input(), user_aggregator, llm, avatar, transport.output(), assistant_aggregator]
+)
+```
+
+Mint a separate Daily meeting token for the avatar, with `user_id` equal to
+`identity`, so your application can recognize the avatar participant. Set the
+pipeline's `audio_out_sample_rate` to 24000.
+
+`audio_playback=avatar` matters because the avatar plays a reply later than
+Higgs Realtime generates it. When the user interrupts, the service truncates
+the reply at the avatar's reported playback position, not at a wall-clock
+estimate. `BotStartedSpeakingFrame` and `BotStoppedSpeakingFrame` likewise
+follow the avatar's playback.
+
+The avatar session starts with the pipeline and ends with `EndFrame` or
+`CancelFrame`. If the avatar ends the session first, the service pushes a fatal
+error. The Avatar session API URL is supplied by your application; there is no
+default endpoint.
+
+To run the example, set the Avatar and Daily values in `.env`, then start it
+and open the printed page:
+
+```bash
+uv run --extra daily python examples/pipecat_boson_avatar_daily.py
+```
+
 ## Supported Higgs Realtime options
 
 Connection options:

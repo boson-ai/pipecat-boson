@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Boson Avatar · Pipecat / Daily</title>
+<style>
+body{font:16px system-ui;max-width:960px;margin:24px auto;padding:0 16px;background:#101218;color:#eee}
+video{max-height:70vh;max-width:100%;background:#191d27;border-radius:12px}button,input{font:inherit;padding:10px;margin:4px}
+#log{white-space:pre-wrap;max-height:22vh;overflow:auto}#status{color:#a7c9eb}
+</style>
+<h1>Boson Avatar with Pipecat and Daily</h1>
+<p id="status">Join to enable the microphone and the avatar's audio.</p>
+<button id="join">Join</button><button id="leave">Leave</button>
+<div id="media"></div>
+<form id="chat"><input id="text" placeholder="Type to interrupt and speak" maxlength="2000"><button>Send</button></form>
+<pre id="log"></pre>
+<script src="https://unpkg.com/@daily-co/daily-js@0.85.0/dist/daily-iframe.js"></script>
+<script>
+// The room URL and token arrive in the URL fragment, which is never sent to a server.
+const config = new URLSearchParams(location.hash.slice(1));
+history.replaceState(null, '', location.pathname);
+const call = Daily.createCallObject({videoSource: false});
+const media = document.querySelector('#media'), status = document.querySelector('#status');
+const elements = new Map();
+call.on('track-started', ({track, participant}) => {
+  if (participant.local) return;
+  const element = document.createElement(track.kind === 'video' ? 'video' : 'audio');
+  element.autoplay = true; element.playsInline = true;
+  element.srcObject = new MediaStream([track]);
+  elements.set(track.id, element); media.append(element);
+  element.play().catch(() => { status.textContent = 'Click Join to allow audio playback'; });
+});
+call.on('track-stopped', ({track}) => { elements.get(track.id)?.remove(); elements.delete(track.id); });
+call.on('app-message', ({data}) => {
+  if (data.type === 'transcript') {
+    const log = document.querySelector('#log');
+    log.textContent += `${data.role}: ${data.text}\n`; log.scrollTop = log.scrollHeight;
+  }
+});
+call.on('error', e => { status.textContent = e.errorMsg || 'Daily connection error'; });
+document.querySelector('#join').onclick = async () => {
+  try {
+    await call.join({url: config.get('url'), token: config.get('token')});
+    status.textContent = 'Connected · Pipecat voice / Boson Avatar';
+  } catch (e) { status.textContent = e.message; }
+};
+document.querySelector('#leave').onclick = async () => { await call.leave(); status.textContent = 'Disconnected'; };
+document.querySelector('#chat').onsubmit = e => {
+  e.preventDefault();
+  const text = document.querySelector('#text');
+  if (text.value.trim()) call.sendAppMessage({type: 'chat', text: text.value.trim()}, '*');
+  text.value = '';
+};
+</script></html>

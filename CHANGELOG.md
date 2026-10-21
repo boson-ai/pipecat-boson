@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Add `pipecat_boson.avatar.BosonAvatarService`, which renders the bot's speech as a Boson Avatar participant in a Daily room, with an example and browser page.
+- Add the `audio_playback` option to `BosonRealtimeLLMService`. An interrupted reply is truncated at the player's reported playback position, which stays correct when playback outlasts generation.
+
 ### Fixed
 
 - Cap `pipecat-ai` below 1.13. Pipecat 1.13.0 added a `direction` argument to `OpenAIRealtimeLLMService._handle_context` and made `get_llm_invocation_params` async, which broke the service on the first context frame and when sending conversation messages.

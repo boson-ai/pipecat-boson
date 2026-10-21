@@ -8,7 +8,7 @@ import json
 import uuid
 from collections import deque
 from types import SimpleNamespace
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
@@ -22,6 +22,7 @@ from pipecat.frames.frames import (
     LLMMessagesAppendFrame,
     LLMSetToolsFrame,
     LLMTextFrame,
+    TTSAudioRawFrame,
     TTSStoppedFrame,
     TTSTextFrame,
     UserStartedSpeakingFrame,
@@ -124,6 +125,22 @@ _BOSON_IGNORED_SERVER_EVENT_TYPES = {
 _BOSON_TRANSCRIPTION_DEDUP_CACHE_SIZE = 4096
 
 
+class AudioPlayback(Protocol):
+    """A downstream player that knows how much generated audio the user heard.
+
+    Pass one as ``audio_playback`` when speech plays with extra latency, for
+    example through an avatar renderer. Interruptions then truncate replies at
+    the player's position instead of a wall-clock estimate, and generation
+    completion no longer drops the identity of a reply that is still playing.
+    """
+
+    def track_audio(self, frame: TTSAudioRawFrame, *, response_id: str, item_id: str, content_index: int) -> bool:
+        """Register generated audio before it is pushed. Return False to drop a stale frame."""
+
+    async def interrupt(self) -> list[tuple[str, int, int]]:
+        """Stop playback. Return ``(item_id, content_index, audio_end_ms)`` for audio not fully heard."""
+
+
 class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
     """Pipecat realtime LLM service backed by Boson's WebSocket API.
 
@@ -153,6 +170,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         input_audio_noise_reduction: Any = UNSET,
         truncation: Literal["auto", "disabled"] = "auto",
         query_params: dict[str, str] | None = None,
+        audio_playback: AudioPlayback | None = None,
         **kwargs,
     ) -> None:
         """Create a Boson realtime service.
@@ -180,6 +198,8 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             input_audio_noise_reduction: Optional noise reduction config or type.
             truncation: Boson input truncation mode, ``"auto"`` or ``"disabled"``.
             query_params: Optional query parameters to merge into ``url``.
+            audio_playback: Optional player that reports what the user heard,
+                such as ``pipecat_boson.avatar.BosonAvatarService``.
             **kwargs: Additional arguments passed to Pipecat's OpenAI realtime
                 base service.
         """
@@ -262,6 +282,8 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         self._boson_completed_transcription_item_id_order: deque[str] = deque()
         self._boson_terminal_session_event_type: str | None = None
         self._boson_response_start_frame_active = False
+        self._boson_audio_playback = audio_playback
+        self._boson_audio_delta = None
 
         if session_tools is not None:
             self._sync_registered_tool_handlers(session_tools)
@@ -765,7 +787,55 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
     async def _handle_evt_audio_delta(self, evt):
         if self._is_stale_response_event(evt):
             return
-        await super()._handle_evt_audio_delta(evt)
+        self._boson_audio_delta = evt
+        try:
+            await super()._handle_evt_audio_delta(evt)
+        finally:
+            self._boson_audio_delta = None
+
+    async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
+        """Push a frame, first registering generated audio with ``audio_playback``."""
+
+        delta = self._boson_audio_delta
+        if self._boson_audio_playback is not None and delta is not None and isinstance(frame, TTSAudioRawFrame):
+            if not self._boson_audio_playback.track_audio(
+                frame,
+                response_id=delta.response_id,
+                item_id=delta.item_id,
+                content_index=delta.content_index,
+            ):
+                return
+        await super().push_frame(frame, direction)
+
+    async def _truncate_current_audio_response(self):
+        if self._boson_audio_playback is None:
+            await super()._truncate_current_audio_response()
+            return
+
+        self._current_audio_response = None
+        try:
+            truncations = await self._boson_audio_playback.interrupt()
+        except Exception as exc:  # noqa: BLE001 - Without a playback position the conversation would diverge.
+            await self.push_error(
+                error_msg=f"Audio playback did not report its interrupted position: {exc}",
+                exception=exc,
+                fatal=True,
+            )
+            return
+        for item_id, content_index, audio_end_ms in truncations:
+            await self.send_client_event(
+                events.ConversationItemTruncateEvent(
+                    item_id=item_id,
+                    content_index=content_index,
+                    audio_end_ms=audio_end_ms,
+                )
+            )
+
+    async def _handle_bot_stopped_speaking(self):
+        # With audio_playback, a playback-finished signal can belong to an older
+        # reply than the one being generated; the player owns reply identity.
+        if self._boson_audio_playback is None:
+            await super()._handle_bot_stopped_speaking()
 
     async def _handle_evt_text_delta(self, evt):
         if self._is_stale_response_event(evt):
