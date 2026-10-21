@@ -300,6 +300,40 @@ transport automatically.
 Keep `on_session_created` handlers fast. Session setup waits for this handler
 to return.
 
+## Boson-specific server events
+
+The integration converts OpenAI-compatible realtime events into standard
+Pipecat frames. It forwards the following Boson-specific events, which do not
+have corresponding Pipecat frames, unchanged to web clients as RTVI
+`server-message` data:
+
+| Event | Description |
+| --- | --- |
+| `response.output_audio_transcript.length` | Associates the transcript fragment in `delta` with its generated audio duration in milliseconds (`length_ms`). The event also includes `event_id`, `response_id`, `item_id`, `output_index`, and `content_index`. |
+
+Receive these events with the Pipecat Web Client SDK's `onServerMessage`
+callback:
+
+```javascript
+import { PipecatClient } from "@pipecat-ai/client-js";
+
+const client = new PipecatClient({
+  transport,
+  callbacks: {
+    onServerMessage: (event) => {
+      if (event?.type === "response.output_audio_transcript.length") {
+        console.log(event.delta, event.length_ms);
+      }
+    },
+  },
+});
+```
+
+No Boson service event handler or manual call to `send_server_message()` is
+required in the bot application. The server-side `PipelineWorker` must have
+RTVI enabled; workers created with `enable_rtvi=False` do not send these events
+to web clients.
+
 ## Supported Higgs Realtime options
 
 Connection options:
