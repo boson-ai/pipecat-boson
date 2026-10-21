@@ -17,6 +17,7 @@ from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import (
     AggregatedTextFrame,
     Frame,
+    InterimTranscriptionFrame,
     LLMConfigureOutputFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -38,6 +39,7 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.openai.realtime import events
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.utils.text.base_text_aggregator import AggregationType
+from pipecat.utils.time import time_now_iso8601
 from pydantic import BaseModel
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
@@ -265,6 +267,9 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         self._boson_pending_message_appends: list[LLMMessagesAppendFrame] = []
         self._boson_completed_transcription_item_ids: set[str] = set()
         self._boson_completed_transcription_item_id_order: deque[str] = deque()
+        # call_ids of tool calls the server runs itself (server tools such as
+        # web_search). They are not ours to run or answer.
+        self._boson_server_call_ids: deque[str] = deque(maxlen=_BOSON_TRANSCRIPTION_DEDUP_CACHE_SIZE)
         self._boson_terminal_session_event_type: str | None = None
         self._boson_response_start_frame_active = False
 
@@ -304,6 +309,8 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
                 return
 
             self._boson_terminal_session_event_type = None
+            # call_ids belong to one session; a new connection starts with none.
+            self._boson_server_call_ids.clear()
             headers = {"User-Agent": "Pipecat Boson realtime service"}
             if self.api_key:
                 headers["Authorization"] = f"Bearer {self.api_key}"
@@ -602,7 +609,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             if asyncio.iscoroutine(result):
                 await result
         elif event_type == "response.output_item.added":
-            self._track_function_call_item(event)
+            self._track_function_call(getattr(evt, "item", None))
         elif event_type == "error":
             return await self._handle_error_event(evt)
         elif event_type in _BOSON_TERMINAL_SESSION_EVENT_TYPES:
@@ -632,10 +639,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         item = evt.item
         item_id = getattr(item, "id", None)
 
-        if getattr(item, "type", None) == "function_call":
-            call_id = getattr(item, "call_id", None)
-            if call_id and call_id not in self._pending_function_calls:
-                self._pending_function_calls[call_id] = item
+        self._track_function_call(item)
 
         if item_id:
             await self._call_event_handler("on_conversation_item_created", item_id, item)
@@ -698,6 +702,19 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         if item_id and not self._mark_transcription_item_completed(item_id):
             return
         await super().handle_evt_input_audio_transcription_completed(evt)
+
+    async def _handle_evt_speech_stopped(self, evt) -> None:
+        """Mark the caller's turn as soon as the server ends it.
+
+        The server's transcript of a turn can arrive after the reply to it has
+        started, so clients that order the conversation by arrival (the Pipecat
+        playground) put the caller's words under the reply. An empty interim
+        transcript now opens the caller's turn first; the final transcript then
+        fills it in.
+        """
+        await super()._handle_evt_speech_stopped(evt)
+        if self.user_transcription_enabled:
+            await self.push_frame(InterimTranscriptionFrame("", "", time_now_iso8601()), FrameDirection.UPSTREAM)
 
     async def _handle_evt_input_audio_transcription_failed(self, evt) -> None:
         error = getattr(evt, "error", None)
@@ -904,14 +921,33 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             return True
         return False
 
-    def _track_function_call_item(self, event: dict[str, Any]) -> None:
-        item = event.get("item") or {}
-        if item.get("type") != "function_call":
+    def _track_function_call(self, item: Any) -> None:
+        """Track a function_call item as a call to run here, unless the server runs it.
+
+        Server tools (``{"type": "web_search"}``) show up as ordinary
+        ``function_call`` items with ``executor: "server"``. The server runs
+        them and adds the ``function_call_output`` itself; the result is spoken
+        in the next turn, or in a reply the server starts after a pause. A
+        client must not run them, answer them or request a response. Either
+        item event may carry the executor, so a call once marked stays the
+        server's and leaves the pending calls.
+        """
+        if getattr(item, "type", None) != "function_call":
             return
-        call_id = item.get("call_id")
-        if not call_id or call_id in self._pending_function_calls:
+        call_id = getattr(item, "call_id", None)
+        if getattr(item, "executor", None) == "server" or call_id in self._boson_server_call_ids:
+            if call_id and call_id not in self._boson_server_call_ids:
+                self._boson_server_call_ids.append(call_id)
+                logger.debug(f"Server is running tool {getattr(item, 'name', None)!r} (call_id={call_id})")
+            self._pending_function_calls.pop(call_id, None)
             return
-        self._pending_function_calls[call_id] = _to_attr(item)
+        if call_id and call_id not in self._pending_function_calls:
+            self._pending_function_calls[call_id] = item
+
+    async def _handle_evt_function_call_arguments_done(self, evt):
+        if getattr(evt, "call_id", None) in self._boson_server_call_ids:
+            return
+        await super()._handle_evt_function_call_arguments_done(evt)
 
     def _current_model(self) -> str:
         if is_given(self._settings.model) and self._settings.model:

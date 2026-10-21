@@ -14,6 +14,7 @@ from pipecat.frames.frames import (
     Frame,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
+    InterimTranscriptionFrame,
     InterruptionFrame,
     LLMConfigureOutputFrame,
     LLMContextFrame,
@@ -1761,3 +1762,164 @@ async def test_wire_and_handler_registry_agree_across_a_sequence_of_updates():
 
     await service._update_settings(service.Settings(session_properties=events.SessionProperties(tool_choice="none")))
     assert await agree()
+
+
+@pytest.mark.asyncio
+async def test_server_executed_tool_calls_are_not_run_or_answered():
+    # A server tool (web_search) arrives as a function_call with executor "server".
+    # The server runs it and adds the output itself; the client must do nothing.
+    service = CapturingBosonRealtimeLLMService()
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    service._context = LLMContext([])
+    dispatched = []
+
+    async def run_function_calls(function_calls):
+        dispatched.extend(call.function_name for call in function_calls)
+
+    service.run_function_calls = run_function_calls
+    item = {
+        "id": "item_1",
+        "type": "function_call",
+        "name": "web_search",
+        "call_id": "call_server",
+        "arguments": "",
+        "executor": "server",
+    }
+    sent = len(service.sent)
+
+    await service._dispatch_boson_server_event(
+        {"type": "response.output_item.added", "response_id": "r", "item": item}
+    )
+    await service._dispatch_boson_server_event({"type": "conversation.item.added", "item": item})
+    await service._dispatch_boson_server_event(
+        {"type": "response.function_call_arguments.done", "call_id": "call_server", "arguments": '{"queries": ["x"]}'}
+    )
+
+    assert "call_server" not in service._pending_function_calls
+    assert dispatched == []
+    assert not [e for e in service.sent[sent:] if e["type"] in ("conversation.item.create", "response.create")]
+
+
+@pytest.mark.asyncio
+async def test_client_executed_tool_calls_are_still_tracked():
+    service = CapturingBosonRealtimeLLMService()
+    item = {
+        "id": "item_2",
+        "type": "function_call",
+        "name": "get_time",
+        "call_id": "call_client",
+        "executor": "client",
+    }
+
+    await service._dispatch_boson_server_event(
+        {"type": "response.output_item.added", "response_id": "r", "item": item}
+    )
+
+    assert "call_client" in service._pending_function_calls
+
+
+def _dispatch_recorder(service):
+    dispatched = []
+
+    async def run_function_calls(function_calls):
+        dispatched.extend(call.function_name for call in function_calls)
+
+    service.run_function_calls = run_function_calls
+    return dispatched
+
+
+@pytest.mark.asyncio
+async def test_client_executed_tool_calls_are_dispatched():
+    service = CapturingBosonRealtimeLLMService()
+    service._context = LLMContext([])
+    dispatched = _dispatch_recorder(service)
+    item = {
+        "id": "item_2",
+        "type": "function_call",
+        "name": "get_time",
+        "call_id": "call_client",
+        "executor": "client",
+    }
+
+    await service._dispatch_boson_server_event({"type": "conversation.item.added", "item": item})
+    await service._dispatch_boson_server_event(
+        {"type": "response.function_call_arguments.done", "call_id": "call_client", "arguments": "{}"}
+    )
+
+    assert dispatched == ["get_time"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marked_on_output_item", [True, False])
+@pytest.mark.parametrize("output_item_first", [True, False])
+async def test_a_call_marked_server_by_either_item_event_is_not_dispatched(marked_on_output_item, output_item_first):
+    # The executor may sit on only one of the two item events, in either order.
+    service = CapturingBosonRealtimeLLMService()
+    service._context = LLMContext([])
+    dispatched = _dispatch_recorder(service)
+    marked = {"id": "item_1", "type": "function_call", "name": "web_search", "call_id": "call_s", "executor": "server"}
+    unmarked = {key: value for key, value in marked.items() if key != "executor"}
+    events = [
+        {
+            "type": "response.output_item.added",
+            "response_id": "r",
+            "item": marked if marked_on_output_item else unmarked,
+        },
+        {"type": "conversation.item.added", "item": unmarked if marked_on_output_item else marked},
+    ]
+    for event in events if output_item_first else events[::-1]:
+        await service._dispatch_boson_server_event(event)
+    await service._dispatch_boson_server_event(
+        {"type": "response.function_call_arguments.done", "call_id": "call_s", "arguments": "{}"}
+    )
+
+    assert "call_s" not in service._pending_function_calls
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_server_call_ids_are_forgotten_on_a_new_connection(monkeypatch):
+    service = CapturingBosonRealtimeLLMService()
+    await service._dispatch_boson_server_event(
+        {
+            "type": "conversation.item.added",
+            "item": {"id": "i", "type": "function_call", "name": "web_search", "call_id": "c", "executor": "server"},
+        }
+    )
+    assert "c" in service._boson_server_call_ids
+
+    async def fake_connect(**kwargs):
+        return object()
+
+    async def no_session_update():
+        return None
+
+    monkeypatch.setattr("pipecat_boson.realtime.llm.websocket_connect", fake_connect)
+    monkeypatch.setattr(service, "create_task", lambda coroutine: coroutine.close())
+    monkeypatch.setattr(service, "_send_session_update", no_session_update)
+    service._websocket = None
+    await service._connect()
+
+    assert "c" not in service._boson_server_call_ids
+
+
+@pytest.mark.asyncio
+async def test_speech_stopped_opens_the_callers_turn_before_the_reply():
+    # The server's transcript of a turn can arrive after the reply starts. An
+    # empty interim transcript at speech_stopped lets clients place the turn first.
+    service = CapturingBosonRealtimeLLMService(input_audio_transcription_model="higgs-stt-3.1")
+
+    await service._handle_evt_speech_stopped(SimpleNamespace(type="input_audio_buffer.speech_stopped"))
+
+    interim = [f for f in service.pushed if isinstance(f, InterimTranscriptionFrame)]
+    assert len(interim) == 1 and interim[0].text == ""
+
+
+@pytest.mark.asyncio
+async def test_speech_stopped_sends_no_interim_transcript_without_transcription():
+    service = CapturingBosonRealtimeLLMService()
+
+    await service._handle_evt_speech_stopped(SimpleNamespace(type="input_audio_buffer.speech_stopped"))
+
+    assert not [f for f in service.pushed if isinstance(f, InterimTranscriptionFrame)]

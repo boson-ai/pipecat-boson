@@ -21,7 +21,7 @@ DEFAULT_TURN_DETECTION: dict[str, Any] = {
     "interrupt_response": True,
     "prefix_padding_ms": 300,
     "silence_duration_ms": 500,
-    "threshold": 0.55,
+    "threshold": 0.85,
 }
 
 

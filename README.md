@@ -235,6 +235,25 @@ and registers the handlers for the Higgs Realtime session, while
 `LLMContext` keeps the tool definitions with the conversation state. After the
 function completes, Higgs Realtime continues the response with its result.
 
+### Use server tools
+
+Higgs Realtime runs some tools on its own servers, such as `web_search`.
+Declare them next to your functions with `ToolsSchema`; there is no handler to
+write and nothing to send back:
+
+```python
+from pipecat.adapters.schemas.tools_schema import AdapterType, ToolsSchema
+
+tools = ToolsSchema(
+    standard_tools=[get_weather],
+    custom_tools={AdapterType.OPENAI: [{"type": "web_search"}]},
+)
+```
+
+The service ignores calls marked `executor: "server"`. The server runs them and
+adds the result; the answer is spoken in the next turn, or in a reply the
+server starts after a pause.
+
 ## Configure turn detection
 
 Server VAD is enabled by default. It detects the end of the user's turn,
@@ -247,7 +266,7 @@ turn_detection = {
     "type": "server_vad",
     "prefix_padding_ms": 300,
     "silence_duration_ms": 500,
-    "threshold": 0.55,
+    "threshold": 0.85,
 }
 ```
 
