@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+- Raised the default server VAD `threshold` from `0.55` to `0.85`, matching the Boson Realtime server default. Quiet or distant speech is less likely to start a turn; pass a lower `threshold` in `turn_detection` for far-field input.
+
 ### Fixed
 
 - Cap `pipecat-ai` below 1.13. Pipecat 1.13.0 added a `direction` argument to `OpenAIRealtimeLLMService._handle_context` and made `get_llm_invocation_params` async, which broke the service on the first context frame and when sending conversation messages.
