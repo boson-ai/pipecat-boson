@@ -51,7 +51,7 @@ To use a local checkout from another `uv` project:
 uv add --editable ../pipecat-boson
 ```
 
-The package supports `pipecat-ai>=1.4.0,<1.13` and is tested with Pipecat v1.12.0. Pipecat 1.13.0 changed `_handle_context` and made `get_llm_invocation_params` async, so it is not supported yet.
+The package supports `pipecat-ai>=1.4.0,<2`. CI tests it against Pipecat 1.4.0, 1.7.0, 1.8.0, 1.12.0 and the newest release.
 
 ## Configure the connection
 
