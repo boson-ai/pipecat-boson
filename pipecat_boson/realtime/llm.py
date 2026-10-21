@@ -901,8 +901,9 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
 
         Server tools (``{"type": "web_search"}``) show up as ordinary
         ``function_call`` items with ``executor: "server"``. The server runs
-        them, adds the ``function_call_output`` and continues the response on
-        its own; a client must not run them, answer them or request a response.
+        them and adds the ``function_call_output`` itself; the result is spoken
+        in the next turn, or in a reply the server starts after a pause. A
+        client must not run them, answer them or request a response.
         """
         executor = item.get("executor") if isinstance(item, dict) else getattr(item, "executor", None)
         if executor != "server":

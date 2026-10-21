@@ -1239,17 +1239,17 @@ async def test_reply_transcript_is_reported_as_spoken_text():
 @pytest.mark.asyncio
 async def test_server_executed_tool_calls_are_not_run_or_answered():
     # A server tool (web_search) arrives as a function_call with executor "server".
-    # The server runs it, adds the output and continues; the client must do nothing.
+    # The server runs it and adds the output itself; the client must do nothing.
     service = CapturingBosonRealtimeLLMService()
     service._api_session_ready = True
     service._llm_needs_conversation_setup = False
     service._context = LLMContext([])
-    ran = []
+    dispatched = []
 
-    async def web_search(params):
-        ran.append(params)
+    async def run_function_calls(function_calls):
+        dispatched.extend(call.function_name for call in function_calls)
 
-    service.register_function("web_search", web_search)
+    service.run_function_calls = run_function_calls
     item = {
         "id": "item_1",
         "type": "function_call",
@@ -1269,7 +1269,7 @@ async def test_server_executed_tool_calls_are_not_run_or_answered():
     )
 
     assert "call_server" not in service._pending_function_calls
-    assert ran == []
+    assert dispatched == []
     assert not [e for e in service.sent[sent:] if e["type"] in ("conversation.item.create", "response.create")]
 
 
