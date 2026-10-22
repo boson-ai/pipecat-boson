@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-10-22
+
 ### Changed
 
 - Merge a runtime settings update into the current session properties instead of replacing them, so fields the update does not mention keep their values. Setting a field to `None` still clears it, which now also works for `tools`. An update that changes nothing no longer sends a `session.update`. Pipecat's own settings update replaces the session properties wholesale.
