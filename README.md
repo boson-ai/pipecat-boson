@@ -250,9 +250,22 @@ tools = ToolsSchema(
 )
 ```
 
-The service ignores calls marked `executor: "server"`. The server runs them and
-adds the result; the answer is spoken in the next turn, or in a reply the
-server starts after a pause.
+The service ignores calls marked `executor: "server"`. Before a server tool
+runs, the model says a short filler, or Higgs Realtime says "One moment." if
+the model says nothing, and that reply ends. When the result is in, Higgs
+Realtime starts a reply with it on its own. If the caller speaks first, the
+result goes into the reply to them.
+
+Higgs Realtime runs a tool itself whenever its name matches one of its server
+tools, so give your own functions different names.
+
+`web_search` can be narrowed with `allowed_domains` or `excluded_domains` (up
+to five bare hosts such as `"example.com"`, not both) and a two-letter country
+code. Searches are billed at $5 per 1,000.
+
+```python
+{"type": "web_search", "allowed_domains": ["weather.com"], "location": {"country": "US"}}
+```
 
 ## Configure turn detection
 
