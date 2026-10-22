@@ -83,11 +83,10 @@ jobs:
   publish:
     needs: prepare
     runs-on: ubuntu-latest
-    # PyPI accepts uploads only from this environment; its required reviewers approve each release.
+    # The PyPI token is a secret of this environment: a job gets it only from main, after a required reviewer approves.
     environment: pypi
     permissions:
       contents: write # push the release commit and tag, create the GitHub Release
-      id-token: write # PyPI trusted publishing
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
@@ -115,10 +114,11 @@ jobs:
           enable-cache: false
       - name: Upload
         env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
           PUBLISH_URL: >-
             ${{ github.repository == 'boson-ai/pipecat-boson'
             && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
-        run: uv publish --trusted-publishing always --publish-url "$PUBLISH_URL"
+        run: uv publish --trusted-publishing never --publish-url "$PUBLISH_URL"
       - name: Create the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
