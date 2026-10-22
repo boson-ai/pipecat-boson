@@ -31,6 +31,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.11"
+          enable-cache: false
       - name: Bump the version and date the changelog
         id: bump
         env:
@@ -39,6 +40,14 @@ jobs:
           echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           uv version --bump "$BUMP" --frozen
           version="$(uv version --short)"
+          # `publish` pushes before it uploads, which is only safe for a version the index doesn't have.
+          index=https://pypi.org
+          [ "$GITHUB_REPOSITORY" = boson-ai/pipecat-boson ] || index=https://test.pypi.org
+          status="$(curl -sS -o /dev/null -w '%{http_code}' "$index/pypi/pipecat-boson/$version/json")"
+          if [ "$status" != 404 ]; then
+            echo "Expected $version to be new on $index, got HTTP $status"
+            exit 1
+          fi
           uv run --no-project python - "$version" <<'PY'
           import datetime, pathlib, re, sys
 
@@ -56,6 +65,7 @@ jobs:
           pathlib.Path("notes.md").write_text(notes.strip() + "\n")
           PY
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          { echo "## Releasing $version"; cat notes.md; } >> "$GITHUB_STEP_SUMMARY"
       - run: uv sync --extra test
       - run: uv run --no-sync python -m pytest -q
       - run: uv build
@@ -101,6 +111,8 @@ jobs:
           # Fails without pushing anything if main moved since `prepare`.
           git push --atomic origin HEAD:main "v$VERSION"
       - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
       - name: Upload
         env:
           PUBLISH_URL: >-
