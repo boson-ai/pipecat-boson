@@ -235,6 +235,38 @@ and registers the handlers for the Higgs Realtime session, while
 `LLMContext` keeps the tool definitions with the conversation state. After the
 function completes, Higgs Realtime continues the response with its result.
 
+### Use server tools
+
+Higgs Realtime runs some tools on its own servers, such as `web_search`.
+Declare them next to your functions with `ToolsSchema`; there is no handler to
+write and nothing to send back:
+
+```python
+from pipecat.adapters.schemas.tools_schema import AdapterType, ToolsSchema
+
+tools = ToolsSchema(
+    standard_tools=[get_weather],
+    custom_tools={AdapterType.OPENAI: [{"type": "web_search"}]},
+)
+```
+
+The service ignores calls marked `executor: "server"`. Before a server tool
+runs, the model says a short filler, or Higgs Realtime says "One moment." if
+the model says nothing, and that reply ends. When the result is in, Higgs
+Realtime starts a reply with it on its own. If the caller speaks first, the
+result goes into the reply to them.
+
+Higgs Realtime runs a tool itself whenever its name matches one of its server
+tools, so give your own functions different names.
+
+`web_search` can be narrowed with `allowed_domains` or `excluded_domains` (up
+to five bare hosts such as `"example.com"`, not both) and a two-letter country
+code. Searches are billed at $5 per 1,000.
+
+```python
+{"type": "web_search", "allowed_domains": ["weather.com"], "location": {"country": "US"}}
+```
+
 ## Configure turn detection
 
 Server VAD is enabled by default. It detects the end of the user's turn,
@@ -247,7 +279,7 @@ turn_detection = {
     "type": "server_vad",
     "prefix_padding_ms": 300,
     "silence_duration_ms": 500,
-    "threshold": 0.55,
+    "threshold": 0.85,
 }
 ```
 

@@ -11,6 +11,7 @@ SAMPLE_RATE = 24000
 DEFAULT_OUTPUT_MODALITIES = ["audio"]
 VALID_OUTPUT_MODALITIES = ("text", "audio")
 MAX_OUTPUT_TOKENS_LIMIT = 4096
+SUPPORTED_SEMANTIC_EAGERNESS = ("auto",)
 
 UNSET = object()
 
@@ -20,7 +21,7 @@ DEFAULT_TURN_DETECTION: dict[str, Any] = {
     "interrupt_response": True,
     "prefix_padding_ms": 300,
     "silence_duration_ms": 500,
-    "threshold": 0.55,
+    "threshold": 0.85,
 }
 
 
@@ -73,7 +74,16 @@ def build_turn_detection(value: Any = UNSET) -> dict[str, Any] | None:
         return dict(DEFAULT_TURN_DETECTION)
     if value is None or value is False:
         return None
-    return dict(value)
+
+    turn_detection = dict(value)
+    eagerness = turn_detection.get("eagerness")
+    if eagerness is not None and eagerness not in SUPPORTED_SEMANTIC_EAGERNESS:
+        raise ValueError(
+            f"turn_detection eagerness must be one of {SUPPORTED_SEMANTIC_EAGERNESS} "
+            f"(got {eagerness!r}); Boson terminates the session for any other value, "
+            "even though Pipecat's semantic VAD model accepts low/medium/high."
+        )
+    return turn_detection
 
 
 def build_input_audio_transcription(

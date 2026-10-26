@@ -1,0 +1,127 @@
+name: Release
+
+# Run from the Actions tab. `prepare` bumps the version, dates the changelog,
+# tests and builds without pushing anything. `publish` waits for a required
+# reviewer of the `pypi` environment, then pushes the release commit and tag,
+# uploads to PyPI and creates the GitHub Release. Runs outside boson-ai, such
+# as on a fork, upload to TestPyPI instead.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "patch: only fixes. minor: something was added."
+        type: choice
+        options: [patch, minor]
+
+concurrency: release
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      base: ${{ steps.bump.outputs.base }}
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+          enable-cache: false
+      - name: Bump the version and date the changelog
+        id: bump
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          uv version --bump "$BUMP" --frozen
+          version="$(uv version --short)"
+          # `publish` pushes before it uploads, which is only safe for a version the index doesn't have.
+          index=https://pypi.org
+          [ "$GITHUB_REPOSITORY" = boson-ai/pipecat-boson ] || index=https://test.pypi.org
+          status="$(curl -sS -o /dev/null -w '%{http_code}' "$index/pypi/pipecat-boson/$version/json")"
+          if [ "$status" != 404 ]; then
+            echo "Expected $version to be new on $index, got HTTP $status"
+            exit 1
+          fi
+          uv run --no-project python - "$version" <<'PY'
+          import datetime, pathlib, re, sys
+
+          version = sys.argv[1]
+          init = pathlib.Path("pipecat_boson/__init__.py")
+          init.write_text(re.sub(r'^__version__ = ".*"$', f'__version__ = "{version}"', init.read_text(), flags=re.M))
+
+          changelog = pathlib.Path("CHANGELOG.md")
+          head, found, rest = changelog.read_text().partition("## [Unreleased]\n")
+          notes, next_heading, older = rest.partition("\n## [")
+          if not found or not notes.strip():
+              sys.exit("CHANGELOG.md has nothing under [Unreleased]")
+          dated = f"## [Unreleased]\n\n## [{version}] - {datetime.date.today()}\n"
+          changelog.write_text(head + dated + notes + next_heading + older)
+          pathlib.Path("notes.md").write_text(notes.strip() + "\n")
+          PY
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          { echo "## Releasing $version"; cat notes.md; } >> "$GITHUB_STEP_SUMMARY"
+      - run: uv sync --extra test
+      - run: uv run --no-sync python -m pytest -q
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          if-no-files-found: error
+          path: |
+            CHANGELOG.md
+            pyproject.toml
+            pipecat_boson/__init__.py
+            dist/
+            notes.md
+
+  publish:
+    needs: prepare
+    runs-on: ubuntu-latest
+    # The PyPI token is a secret of this environment: a job gets it only from main, after a required reviewer approves.
+    environment: pypi
+    permissions:
+      contents: write # push the release commit and tag, create the GitHub Release
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.base }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+      - name: Commit, tag and push
+        run: |
+          # A re-run after a failed upload finds the tag already pushed.
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" > /dev/null; then
+            echo "v$VERSION is already pushed"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: release $VERSION"
+          git tag "v$VERSION"
+          # Fails without pushing anything if main moved since `prepare`.
+          git push --atomic origin HEAD:main "v$VERSION"
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
+      - name: Upload
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
+          PUBLISH_URL: >-
+            ${{ github.repository == 'boson-ai/pipecat-boson'
+            && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
+        run: uv publish --trusted-publishing never --publish-url "$PUBLISH_URL"
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "v$VERSION" dist/* --repo "$GITHUB_REPOSITORY"
+          --title "$VERSION" --notes-file notes.md --verify-tag
