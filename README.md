@@ -51,7 +51,7 @@ To use a local checkout from another `uv` project:
 uv add --editable ../pipecat-boson
 ```
 
-The package supports `pipecat-ai>=1.4.0,<2`. CI tests it against Pipecat 1.4.0, 1.7.0, 1.8.0, 1.12.0 and the newest release.
+The package supports `pipecat-ai>=1.4.0,<1.15`. CI tests it against Pipecat 1.4.0, 1.7.0, 1.8.0, 1.12.0, 1.13.0 and the newest 1.14 release.
 
 ## Configure the connection
 

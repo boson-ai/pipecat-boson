@@ -1,5 +1,5 @@
 # ruff: noqa: CPY001
-"""Differences between the Pipecat versions this package supports (pipecat-ai 1.4 to 1.13).
+"""Differences between the Pipecat versions this package supports (pipecat-ai 1.4 to 1.14).
 
 Each one is detected once, at import, from Pipecat itself rather than from its version
 number, so ``llm.py`` never branches on a version. No side effects beyond the imports.

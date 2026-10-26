@@ -12,7 +12,7 @@ license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "loguru>=0.7.3,<1",
-    "pipecat-ai>=1.4.0,<2",
+    "pipecat-ai>=1.4.0,<1.15",
     "websockets>=13.1",
 ]
 classifiers = [
@@ -23,7 +23,7 @@ classifiers = [
 
 [project.optional-dependencies]
 webrtc = [
-    "pipecat-ai[runner,webrtc]>=1.4.0,<2",
+    "pipecat-ai[runner,webrtc]>=1.4.0,<1.15",
     "python-dotenv>=1.0.0,<2",
 ]
 test = [
@@ -31,7 +31,7 @@ test = [
     "pytest-asyncio==1.2.0",
 ]
 dev = [
-    "pipecat-ai[runner,webrtc]>=1.4.0,<2",
+    "pipecat-ai[runner,webrtc]>=1.4.0,<1.15",
     "pytest==8.4.2",
     "pytest-asyncio==1.2.0",
     "python-dotenv>=1.0.0,<2",
