@@ -22,6 +22,16 @@ uv run --extra dev ruff check .           # lint
 uv run --extra dev ruff format .          # format (line-length 119, 4-space indent)
 ```
 
+Changes reach `main` only through PRs, and the branch ruleset requires the `ci-ok`
+check. A release is a PR, then a workflow run:
+
+```bash
+uv run --no-project python scripts/release.py bump patch   # or minor; open a PR with the result
+```
+
+Once it is merged, run Actions → Release and approve the `pypi` environment.
+The workflow uploads to PyPI and tags the release; it never pushes to git.
+
 Running the WebRTC browser example needs the heavier `webrtc` extra (pulls in
 `opencv-python`) and a `.env` (copy from `.env.example`):
 
