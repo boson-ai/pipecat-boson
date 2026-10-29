@@ -17,6 +17,7 @@ from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import (
     AggregatedTextFrame,
     Frame,
+    FunctionCallResultFrame,
     InterimTranscriptionFrame,
     LLMConfigureOutputFrame,
     LLMFullResponseEndFrame,
@@ -38,12 +39,19 @@ from pipecat.processors.aggregators.llm_context import (
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.openai.realtime import events
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
-from pipecat.utils.text.base_text_aggregator import AggregationType
 from pipecat.utils.time import time_now_iso8601
 from pydantic import BaseModel
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
+from ._compat import (
+    HANDLE_CONTEXT_TAKES_DIRECTION,
+    SENTENCE_TEXT,
+    assert_given,
+    forget_answered_call,
+    is_given,
+    resolved,
+)
 from .config import (
     DEFAULT_TURN_DETECTION,
     SUPPORTED_SEMANTIC_EAGERNESS,
@@ -56,12 +64,6 @@ from .config import (
     normalize_ws_url,
     resolve_output_modalities,
 )
-
-
-try:  # pipecat-ai >= 1.8.0
-    from pipecat.utils.types import assert_given, is_given
-except ImportError:  # pipecat-ai < 1.8.0
-    from pipecat.services.settings import assert_given, is_given
 
 
 _BOSON_TERMINAL_SESSION_EVENT_TYPES = {
@@ -294,6 +296,12 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
 
         return "audio" in self._boson_output_modalities
 
+    @property
+    def accepts_intermediate_function_call_results(self) -> bool:
+        """Boson has no channel for a tool's partial results: it rejects system items."""
+
+        return False
+
     def _is_turn_detection_disabled(self) -> bool:
         """Whether the application, rather than Boson, drives turn taking.
 
@@ -332,6 +340,17 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         payload = _normalize_response_create_payload(payload)
         await self._ws_send(payload)
 
+    async def _handle_function_call_result(self, frame: FunctionCallResultFrame) -> None:
+        """Send a tool's result as pipecat-ai 1.13 produces it, dropping progress updates Boson can't take."""
+
+        is_final = frame.properties.is_final if frame.properties else True
+        if not is_final and not self.accepts_intermediate_function_call_results:
+            logger.warning(
+                f"Boson takes one result per tool call; dropping a progress update for {frame.function_name}"
+            )
+            return
+        await super()._handle_function_call_result(frame)
+
     async def _send_tool_result(self, tool_call_id: str, result: str):
         """Send Pipecat's already-serialized tool result on the Boson wire."""
 
@@ -341,6 +360,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             call_id=tool_call_id,
             output=result,
         )
+        forget_answered_call(self, tool_call_id)
         await self.send_client_event(events.ConversationItemCreateEvent(item=item))
 
     async def _ws_send(self, realtime_message):
@@ -429,7 +449,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             f"{adapter.get_messages_for_logging(self._context)}"
         )
 
-        llm_invocation_params = adapter.get_llm_invocation_params(self._context)
+        llm_invocation_params = await resolved(adapter.get_llm_invocation_params(self._context))
         messages = llm_invocation_params["messages"]
         for item in messages:
             evt = events.ConversationItemCreateEvent(item=item)
@@ -447,9 +467,11 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
 
         if self._context:
             adapter = self.get_llm_adapter()
-            llm_invocation_params = adapter.get_llm_invocation_params(
-                self._context,
-                system_instruction=instructions,
+            llm_invocation_params = await resolved(
+                adapter.get_llm_invocation_params(
+                    self._context,
+                    system_instruction=instructions,
+                )
             )
             if not runtime_tools_set and llm_invocation_params["tools"]:
                 tools = llm_invocation_params["tools"]
@@ -510,7 +532,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
 
         await super().process_frame(frame, direction)
 
-    async def _handle_context(self, context: LLMContext):
+    async def _handle_context(self, context: LLMContext, direction: FrameDirection = FrameDirection.DOWNSTREAM):
         if self._context is None and self._boson_pending_message_appends:
             self._context = context
             await self._process_completed_function_calls(send_new_results=False)
@@ -523,8 +545,10 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             if run_llm:
                 await self._create_response()
             return
-
-        await super()._handle_context(context)
+        if HANDLE_CONTEXT_TAKES_DIRECTION:
+            await super()._handle_context(context, direction)
+        else:
+            await super()._handle_context(context)
 
     async def _handle_messages_append(self, frame: LLMMessagesAppendFrame) -> None:
         if self._context is None:
@@ -546,7 +570,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
 
     async def _send_conversation_messages(self, messages: list[dict[str, Any]]) -> None:
         adapter = self.get_llm_adapter()
-        llm_invocation_params = adapter.get_llm_invocation_params(LLMContext(list(messages)))
+        llm_invocation_params = await resolved(adapter.get_llm_invocation_params(LLMContext(list(messages))))
         for item in llm_invocation_params["messages"]:
             evt = events.ConversationItemCreateEvent(item=item)
             self._messages_added_manually[evt.item.id] = True
@@ -782,6 +806,8 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
                 future.set_exception(Exception(message))
 
     def _handle_evt_response_created(self, evt) -> None:
+        # Pipecat's handler clears it: a started response takes in everything sent before it.
+        self._results_awaiting_response = False
         response = evt.response
         response_id = getattr(response, "id", None)
         if not response_id:
@@ -824,13 +850,13 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         llm_text_frame.append_to_context = False
         await self.push_frame(llm_text_frame)
 
-        announced = AggregatedTextFrame(text, aggregated_by=AggregationType.SENTENCE)
+        announced = AggregatedTextFrame(text, **SENTENCE_TEXT)
         announced.append_to_context = False
         announced.will_be_spoken = True
         announced.includes_inter_frame_spaces = True
         await self.push_frame(announced)
 
-        spoken = TTSTextFrame(text, aggregated_by=AggregationType.SENTENCE)
+        spoken = TTSTextFrame(text, **SENTENCE_TEXT)
         spoken.will_be_spoken = True
         spoken.includes_inter_frame_spaces = True
         await self.push_frame(spoken)

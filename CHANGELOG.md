@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- Support `pipecat-ai` 1.13 and 1.14 alongside 1.4 to 1.12; the cap moves from `<1.13` to `<1.15`. Pipecat 1.13.0 added a `direction` argument to `OpenAIRealtimeLLMService._handle_context` and made `get_llm_invocation_params` async, which broke the service on the first context frame and when sending conversation messages. It also renamed `AggregationType` to `TextType`, which made the reply transcript print deprecation warnings. On 1.13, a tool's progress updates (results with `is_final=False`) are dropped with a warning: Pipecat sends them as system messages, which Boson rejects, and that ended the session.
+
 ## [0.1.4] - 2026-10-22
 
 ### Changed

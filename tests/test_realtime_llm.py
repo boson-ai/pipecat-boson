@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -11,9 +13,12 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import (
     AggregatedTextFrame,
+    EndFrame,
     Frame,
+    FunctionCallCancelFrame,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
+    FunctionCallResultProperties,
     InterimTranscriptionFrame,
     InterruptionFrame,
     LLMConfigureOutputFrame,
@@ -27,16 +32,21 @@ from pipecat.frames.frames import (
     TTSTextFrame,
     UserStartedSpeakingFrame,
 )
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.task import PipelineTask
 from pipecat.processors.aggregators.llm_context import NOT_GIVEN as LLM_CONTEXT_NOT_GIVEN
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.openai.realtime import events
 from pipecat.tests.utils import run_test
+from pipecat.utils import deprecation as pipecat_deprecation
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 import pipecat_boson.realtime.llm as realtime_llm
 from pipecat_boson.realtime import BosonRealtimeLLMService
+from pipecat_boson.realtime._compat import HANDLE_CONTEXT_TAKES_DIRECTION, SENTENCE_TEXT, forget_answered_call
 from pipecat_boson.realtime.config import DEFAULT_TURN_DETECTION
 
 
@@ -261,7 +271,7 @@ async def test_pipecat_aggregator_tool_result_is_encoded_once_on_boson_wire():
     service._api_session_ready = True
     service._llm_needs_conversation_setup = False
     service._context = LLMContext([context.get_messages()[0]])
-    await service._handle_context(upstream_frames[0].context)
+    await service._handle_context(upstream_frames[0].context, FrameDirection.UPSTREAM)
 
     payload = service.sent[-2]
     assert payload["type"] == "conversation.item.create"
@@ -897,7 +907,7 @@ async def test_messages_append_waits_for_initial_context_before_creating_respons
     assert service._context is None
     assert service.sent == []
 
-    await service._handle_context(context)
+    await service._handle_context(context, FrameDirection.DOWNSTREAM)
 
     assert service._context is context
     assert service._context.get_messages()[-1] == {"role": "user", "content": "weather"}
@@ -917,7 +927,7 @@ async def test_pending_messages_append_without_run_llm_syncs_context_without_cre
     await service._handle_messages_append(
         LLMMessagesAppendFrame(messages=[{"role": "user", "content": "prefill only"}], run_llm=False)
     )
-    await service._handle_context(LLMContext([]))
+    await service._handle_context(LLMContext([]), FrameDirection.DOWNSTREAM)
 
     assert service._context.get_messages()[-1] == {"role": "user", "content": "prefill only"}
     assert [event["type"] for event in service.sent] == [
@@ -949,7 +959,7 @@ async def test_initial_context_with_direct_function_advertises_tool():
             location: City or place name.
         """
 
-    await service._handle_context(LLMContext([], [get_weather]))
+    await service._handle_context(LLMContext([], [get_weather]), FrameDirection.DOWNSTREAM)
 
     assert service.sent[-2]["type"] == "session.update"
     assert service.sent[-2]["session"]["tools"][0]["name"] == "get_weather"
@@ -996,7 +1006,8 @@ async def test_completed_function_call_output_creates_follow_up_response():
                 *service._context.get_messages(),
                 {"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 20 degrees."},
             ]
-        )
+        ),
+        FrameDirection.UPSTREAM,
     )
 
     assert [event["type"] for event in service.sent[-2:]] == [
@@ -1006,6 +1017,85 @@ async def test_completed_function_call_output_creates_follow_up_response():
     assert service.sent[-2]["item"]["type"] == "function_call_output"
     assert service.sent[-2]["item"]["call_id"] == "call_1"
     assert service.sent[-2]["item"]["output"] == "Sunny, 20 degrees."
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not HANDLE_CONTEXT_TAKES_DIRECTION,
+    reason="before pipecat-ai 1.13, Pipecat replies to any context with a new result",
+)
+async def test_downstream_context_sends_function_call_output_without_creating_response():
+    # Pipecat asks for a reply by sending the context upstream; a downstream context only syncs it.
+    service = CapturingBosonRealtimeLLMService()
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    service._context = LLMContext(
+        [
+            {"role": "user", "content": "weather"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}
+                ],
+            },
+        ]
+    )
+
+    await service._handle_context(
+        LLMContext(
+            [
+                *service._context.get_messages(),
+                {"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 20 degrees."},
+            ]
+        ),
+        FrameDirection.DOWNSTREAM,
+    )
+
+    assert [event["type"] for event in service.sent] == ["conversation.item.create"]
+    assert service.sent[0]["item"]["type"] == "function_call_output"
+    assert service.sent[0]["item"]["call_id"] == "call_1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_before_created", [False, True])
+async def test_started_response_takes_in_function_call_output(cancel_before_created):
+    # Any response that starts, even one already cancelled, sees the tool result, so it is no longer awaiting a reply.
+    service = CapturingBosonRealtimeLLMService()
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    service._context = LLMContext(
+        [
+            {"role": "user", "content": "weather"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}
+                ],
+            },
+        ]
+    )
+    context = LLMContext(
+        [
+            *service._context.get_messages(),
+            {"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 20 degrees."},
+        ]
+    )
+
+    await service._handle_context(context, FrameDirection.UPSTREAM)
+    response_create = service.sent[-1]
+    assert response_create["type"] == "response.create"
+    if cancel_before_created:
+        await service._cancel_active_response()
+    service._handle_evt_response_created(make_response_created("resp_1", response_create["event_id"]))
+    await service._handle_evt_response_done(
+        make_response_done("resp_1", status="cancelled" if cancel_before_created else "completed")
+    )
+    sent_count = len(service.sent)
+
+    # The assistant aggregator pushes the context upstream again, with nothing new in it.
+    await service._handle_context(LLMContext(list(context.get_messages())), FrameDirection.UPSTREAM)
+
+    assert service.sent[sent_count:] == []
 
 
 @pytest.mark.asyncio
@@ -1031,7 +1121,8 @@ async def test_function_call_output_waits_until_session_created_to_create_respon
                 *service._context.get_messages(),
                 {"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 20 degrees."},
             ]
-        )
+        ),
+        FrameDirection.UPSTREAM,
     )
 
     assert service.sent[-1]["type"] == "conversation.item.create"
@@ -1054,7 +1145,7 @@ async def test_pending_messages_append_does_not_send_unsupported_skip_tts_overri
         LLMMessagesAppendFrame(messages=[{"role": "user", "content": "text only"}], run_llm=True)
     )
     await service.process_frame(LLMConfigureOutputFrame(skip_tts=False), FrameDirection.DOWNSTREAM)
-    await service._handle_context(LLMContext([]))
+    await service._handle_context(LLMContext([]), FrameDirection.DOWNSTREAM)
 
     assert service.sent[-1]["type"] == "response.create"
     assert "modalities" not in service.sent[-1]["response"]
@@ -1923,3 +2014,213 @@ async def test_speech_stopped_sends_no_interim_transcript_without_transcription(
     await service._handle_evt_speech_stopped(SimpleNamespace(type="input_audio_buffer.speech_stopped"))
 
     assert not [f for f in service.pushed if isinstance(f, InterimTranscriptionFrame)]
+
+
+@pytest.mark.asyncio
+async def test_reply_transcript_frames_are_labelled_as_a_sentence_without_deprecation_warnings(monkeypatch):
+    # pipecat-ai 1.13 renamed the label; the old names still work there, but warn. Pipecat
+    # forces its deprecation warnings to "always", so record them rather than raising, and
+    # it warns once per call site per process, so clear that record (1.13 only).
+    monkeypatch.setattr(pipecat_deprecation, "_warned_sites", set(), raising=False)
+    service = CapturingBosonRealtimeLLMService()
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        await service._push_output_transcript_text_frames("The capital is Rome.")
+
+    assert [str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)] == []
+    _, announced, spoken = service.pushed
+    label_field = next(iter(SENTENCE_TEXT))
+    assert getattr(announced, label_field).value == getattr(spoken, label_field).value == "sentence"
+
+
+def test_forget_answered_call_removes_only_that_call():
+    service = SimpleNamespace(_open_function_calls={"call_1", "call_2"})
+
+    forget_answered_call(service, "call_1")
+
+    assert service._open_function_calls == {"call_2"}
+
+
+def test_forget_answered_call_is_harmless_before_pipecat_tracks_open_calls():
+    # Before pipecat-ai 1.13 there is no _open_function_calls; this must not raise.
+    forget_answered_call(SimpleNamespace(), "call_1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(BosonRealtimeLLMService, "_handle_function_call_cancel"),
+    reason="pipecat-ai 1.13 added the open-call tracking this relies on",
+)
+async def test_cancel_after_a_tool_result_sends_nothing_more():
+    service = CapturingBosonRealtimeLLMService()
+    service._open_function_calls.add("call_1")
+    await service._send_tool_result("call_1", "Sunny, 20 degrees.")
+    sent_count = len(service.sent)
+
+    await service._handle_function_call_cancel(
+        FunctionCallCancelFrame(function_name="get_weather", tool_call_id="call_1")
+    )
+
+    assert len(service.sent) == sent_count
+
+
+# Real-pipeline tests. Pipecat 1.13 changed how context frames and tool results reach
+# the service, so these run the real service between Pipecat's real aggregators, on
+# every supported version. Only the websocket is replaced; Boson's side is played back
+# as server events through the service's own dispatcher.
+
+
+async def _close_nothing():
+    return None
+
+
+class PipelineBosonService(BosonRealtimeLLMService):
+    """The real service for a real pipeline, with the websocket replaced by a capture."""
+
+    def __init__(self, **kwargs):
+        super().__init__(url="ws://localhost:1234/v1/realtime/", api_key="test-key", model="model-1", **kwargs)
+        self.sent: list[dict] = []
+
+    async def _connect(self):
+        if self._websocket:
+            return
+        self._websocket = SimpleNamespace(close=_close_nothing)
+        await self._send_session_update()
+        await self._dispatch_boson_server_event({"type": "session.created", "session": {"id": "session_1"}})
+
+    async def _disconnect(self):
+        self._websocket = None
+
+    async def _ws_send(self, realtime_message):
+        self.sent.append(realtime_message)
+
+
+def sent_types(service):
+    return [
+        f"{message['type']}:{message['item']['type']}"
+        if message["type"] == "conversation.item.create"
+        else message["type"]
+        for message in service.sent
+    ]
+
+
+async def wait_until(condition, timeout=5.0):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not condition():
+        assert asyncio.get_running_loop().time() < deadline, "timed out waiting for the pipeline"
+        await asyncio.sleep(0.01)
+
+
+@contextlib.asynccontextmanager
+async def running_pipeline(service, context):
+    pair = LLMContextAggregatorPair(context)
+    task = PipelineTask(Pipeline([pair.user(), service, pair.assistant()]))
+    runner = asyncio.create_task(PipelineRunner(handle_sigint=False).run(task))
+    try:
+        await wait_until(lambda: service._api_session_ready)
+        await task.queue_frame(LLMContextFrame(context))
+        await wait_until(lambda: "response.create" in sent_types(service))
+        yield task
+    finally:
+        await task.queue_frame(EndFrame())
+        await asyncio.wait_for(runner, 10)
+
+
+async def finish_last_response(service, response_id):
+    """Boson's events for the last response.create: created, then done."""
+
+    create = [message for message in service.sent if message["type"] == "response.create"][-1]
+    metadata = {"client_event_id": create["event_id"]}
+    await service._dispatch_boson_server_event(
+        {"type": "response.created", "response": {"id": response_id, "metadata": metadata}}
+    )
+    await service._dispatch_boson_server_event(
+        {"type": "response.done", "response": {"id": response_id, "status": "completed", "output": [], "usage": None}}
+    )
+
+
+async def call_tool(service, name, arguments):
+    """Boson's events for the model calling a tool: the call item, then its arguments."""
+
+    await service._dispatch_boson_server_event(
+        {
+            "type": "conversation.item.added",
+            "item": {"id": "item_1", "type": "function_call", "call_id": "call_1", "name": name},
+        }
+    )
+    await service._dispatch_boson_server_event(
+        {
+            "type": "response.function_call_arguments.done",
+            "item_id": "item_1",
+            "call_id": "call_1",
+            "name": name,
+            "arguments": json.dumps(arguments),
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_context_frame_in_a_real_pipeline_starts_one_response():
+    service = PipelineBosonService()
+    context = LLMContext([{"role": "user", "content": "What's the weather in Paris?"}])
+
+    async with running_pipeline(service, context):
+        await asyncio.sleep(0.2)
+
+    assert sent_types(service).count("response.create") == 1
+    messages = [message["item"] for message in service.sent if message["type"] == "conversation.item.create"]
+    assert [item["content"][0]["text"] for item in messages] == ["What's the weather in Paris?"]
+
+
+@pytest.mark.asyncio
+async def test_a_tool_call_in_a_real_pipeline_sends_one_result_and_one_follow_up_response():
+    service = PipelineBosonService()
+
+    async def get_weather(params):
+        await params.result_callback({"conditions": "sunny"})
+
+    service.register_function("get_weather", get_weather)
+    context = LLMContext([{"role": "user", "content": "What's the weather in Paris?"}])
+
+    async with running_pipeline(service, context):
+        await finish_last_response(service, "resp_0")
+        before = len(service.sent)
+        await call_tool(service, "get_weather", {"location": "Paris"})
+        await wait_until(lambda: "response.create" in sent_types(service)[before:])
+        await asyncio.sleep(0.2)
+
+    after = service.sent[before:]
+    assert [message["type"] for message in after] == ["conversation.item.create", "response.create"]
+    assert after[0]["item"]["type"] == "function_call_output"
+    assert after[0]["item"]["call_id"] == "call_1"
+    assert after[0]["item"]["output"] == json.dumps({"conditions": "sunny"})
+
+
+@pytest.mark.asyncio
+async def test_a_tool_progress_update_in_a_real_pipeline_never_reaches_boson():
+    # Pipecat 1.13 would send it as a system item, which Boson rejects, ending the session.
+    service = PipelineBosonService()
+
+    async def search_flights(params):
+        await params.result_callback(
+            {"progress": "searching"}, properties=FunctionCallResultProperties(is_final=False)
+        )
+        await params.result_callback({"flights": 3})
+
+    # Only an async tool (cancel_on_interruption=False) may report progress.
+    service.register_function("search_flights", search_flights, cancel_on_interruption=False)
+    context = LLMContext([{"role": "user", "content": "Find me a flight."}])
+
+    async with running_pipeline(service, context):
+        await finish_last_response(service, "resp_0")
+        before = len(service.sent)
+        await call_tool(service, "search_flights", {"to": "Rome"})
+        await wait_until(lambda: "response.create" in sent_types(service)[before:])
+        await asyncio.sleep(0.2)
+
+    after = service.sent[before:]
+    items = [message["item"] for message in after if message["type"] == "conversation.item.create"]
+    assert [item.get("role") for item in items if item["type"] == "message"] == []
+    assert [message["type"] for message in after].count("response.create") == 1
+    assert [item["output"] for item in items if item["type"] == "function_call_output"] == [json.dumps({"flights": 3})]

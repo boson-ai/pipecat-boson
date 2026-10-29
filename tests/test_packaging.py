@@ -16,8 +16,8 @@ def test_package_version_matches_project_metadata():
 def test_package_depends_on_supported_pipecat_runtime():
     pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
 
-    assert "pipecat-ai>=1.4.0,<1.13" in pyproject["project"]["dependencies"]
-    assert "pipecat-ai[runner,webrtc]>=1.4.0,<1.13" in pyproject["project"]["optional-dependencies"]["webrtc"]
+    assert "pipecat-ai>=1.4.0,<1.15" in pyproject["project"]["dependencies"]
+    assert "pipecat-ai[runner,webrtc]>=1.4.0,<1.15" in pyproject["project"]["optional-dependencies"]["webrtc"]
 
 
 def test_manifest_declares_existing_community_integration_files():
