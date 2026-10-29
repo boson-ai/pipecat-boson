@@ -25,12 +25,11 @@ uv run --extra dev ruff format .          # format (line-length 119, 4-space ind
 Changes reach `main` only through PRs, and the branch ruleset requires the `ci-ok`
 check. A release is a PR, then a workflow run:
 
-```bash
-uv run --no-project python scripts/release.py bump patch   # or minor; open a PR with the result
-```
-
-Once it is merged, run Actions → Release and approve the `pypi` environment.
-The workflow uploads to PyPI and tags the release; it never pushes to git.
+1. In a PR: `uv version --bump patch --frozen` (or `minor`), set `__version__` in
+   `pipecat_boson/__init__.py` to match, and rename `## [Unreleased]` in `CHANGELOG.md`
+   to `## [x.y.z] - YYYY-MM-DD` under a new empty `## [Unreleased]`.
+2. Once it is merged, run Actions → Release and approve the `pypi` environment.
+   The workflow uploads to PyPI and tags the release; it never pushes to git.
 
 Running the WebRTC browser example needs the heavier `webrtc` extra (pulls in
 `opencv-python`) and a `.env` (copy from `.env.example`):

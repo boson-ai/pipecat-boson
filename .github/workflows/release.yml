@@ -1,12 +1,13 @@
 name: Release
 
-# Run from the Actions tab once a release PR is merged: it bumps the version and
-# dates the changelog with `python scripts/release.py bump patch|minor`.
-# `prepare` checks that main's version is new on the index and has a dated
-# changelog section, then tests and builds. `publish` waits for a required
-# reviewer of the `pypi` environment, uploads, and creates the GitHub Release,
-# which tags the tested commit. Nothing is pushed to git. Runs outside
-# boson-ai, such as on a fork, upload to TestPyPI instead.
+# Run from the Actions tab once a release PR is merged: it sets the new version
+# in pyproject.toml and `__version__`, and dates the [Unreleased] changelog
+# section as that version under a new empty [Unreleased]. `prepare` checks that
+# main's version is new on the index and has a dated changelog section, then
+# tests and builds. `publish` waits for a required reviewer of the `pypi`
+# environment, uploads, and creates the GitHub Release, which tags the tested
+# commit. Nothing is pushed to git. Runs outside boson-ai, such as on a fork,
+# upload to TestPyPI instead.
 
 on:
   workflow_dispatch:
@@ -47,7 +48,17 @@ jobs:
             echo "Tag v$version already exists. Merge a release PR first."
             exit 1
           fi
-          uv run --no-project python scripts/release.py notes "$version" > notes.md
+          uv run --no-project python - "$version" <<'PY'
+          import pathlib, re, sys
+
+          version = sys.argv[1]
+          text = pathlib.Path("CHANGELOG.md").read_text()
+          heading = re.search(rf"^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}\n", text, re.M)
+          notes = text[heading.end() :].partition("\n## [")[0].strip() if heading else ""
+          if not notes:
+              sys.exit(f"CHANGELOG.md has no dated section with notes for {version}")
+          pathlib.Path("notes.md").write_text(notes + "\n")
+          PY
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           { echo "## Releasing $version"; cat notes.md; } >> "$GITHUB_STEP_SUMMARY"
