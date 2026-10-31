@@ -44,6 +44,7 @@ from pydantic import BaseModel
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
+from .append_relay import BosonMessagesAppendIntent
 from .config import (
     DEFAULT_TURN_DETECTION,
     SUPPORTED_SEMANTIC_EAGERNESS,
@@ -267,6 +268,11 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         self._boson_pending_message_appends: list[LLMMessagesAppendFrame] = []
         self._boson_completed_transcription_item_ids: set[str] = set()
         self._boson_completed_transcription_item_id_order: deque[str] = deque()
+        # None until the first context is seen. Tracks messages already sent (or
+        # already on the server as spoken transcripts) so a later context push
+        # does not re-send them.
+        self._boson_known_messages: dict[int, Any] | None = None
+        self._boson_server_user_transcripts: deque[str] = deque(maxlen=_BOSON_TRANSCRIPTION_DEDUP_CACHE_SIZE)
         # call_ids of tool calls the server runs itself (server tools such as
         # web_search). They are not ours to run or answer.
         self._boson_server_call_ids: deque[str] = deque(maxlen=_BOSON_TRANSCRIPTION_DEDUP_CACHE_SIZE)
@@ -492,6 +498,11 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process Pipecat control frames that require Boson-specific handling."""
 
+        if isinstance(frame, BosonMessagesAppendIntent):
+            await super(OpenAIRealtimeLLMService, self).process_frame(frame, direction)
+            await self._handle_append_intent(frame)
+            return
+
         if isinstance(frame, LLMMessagesAppendFrame):
             await super(OpenAIRealtimeLLMService, self).process_frame(frame, direction)
             await self._handle_messages_append(frame)
@@ -519,12 +530,58 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
                 self._context.add_messages(frame.messages)
                 run_llm = run_llm or frame.run_llm
             self._boson_pending_message_appends.clear()
+            self._remember_context_messages(context)
             await self._setup_conversation_if_needed()
             if run_llm:
                 await self._create_response()
             return
 
+        # Scan before any await: messages the aggregator adds while this update
+        # is being handled are left for the next one.
+        scan = None if self._context is None else self._scan_new_user_messages(context)
+        if self._context is None:
+            self._remember_context_messages(context)
         await super()._handle_context(context)
+        if not scan:
+            return
+        appended, matched_spoken = scan
+        if not appended:
+            return
+        if matched_spoken:
+            # Deferred run_llm=False notes discovered on a spoken-turn push:
+            # sync them to Boson without cancelling the VAD reply in progress.
+            if not self._llm_needs_conversation_setup:
+                await self._send_conversation_messages(appended)
+            return
+        # Pure typed / run_llm=True context push (aggregator only pushes when
+        # run_llm is true for appends).
+        await self._cancel_active_response()
+        if not self._llm_needs_conversation_setup:
+            await self._send_conversation_messages(appended)
+        # Otherwise conversation setup (e.g. reconnect) sends the whole context.
+        await self._create_response()
+
+    async def _handle_append_intent(self, frame: BosonMessagesAppendIntent) -> None:
+        """Handle a relayed append; the aggregator owns context membership."""
+
+        if self._context is None:
+            self._boson_pending_message_appends.append(
+                LLMMessagesAppendFrame(messages=list(frame.messages), run_llm=frame.run_llm)
+            )
+            return
+
+        self._mark_messages_known(frame.messages)
+
+        if frame.run_llm:
+            await self._cancel_active_response()
+
+        if self._llm_needs_conversation_setup:
+            await self._setup_conversation_if_needed()
+        else:
+            await self._send_conversation_messages(list(frame.messages))
+
+        if frame.run_llm:
+            await self._create_response()
 
     async def _handle_messages_append(self, frame: LLMMessagesAppendFrame) -> None:
         if self._context is None:
@@ -532,6 +589,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             return
 
         self._context.add_messages(frame.messages)
+        self._mark_messages_known(frame.messages)
 
         if frame.run_llm:
             await self._cancel_active_response()
@@ -543,6 +601,75 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
 
         if frame.run_llm:
             await self._create_response()
+
+    def _remember_context_messages(self, context: LLMContext) -> None:
+        self._boson_known_messages = {id(message): message for message in context.get_messages()}
+
+    def _mark_messages_known(self, messages: list[Any]) -> None:
+        if self._boson_known_messages is None:
+            return
+        for message in messages:
+            self._boson_known_messages[id(message)] = message
+
+    def _scan_new_user_messages(self, context: LLMContext) -> tuple[list[dict[str, Any]], bool]:
+        """Return (appended user messages, matched_spoken) since the last look.
+
+        Messages are tracked by identity. Spoken turns written back from server
+        transcripts are skipped. ``matched_spoken`` is true when this update
+        also consumed at least one transcript (spoken-turn push).
+        """
+
+        messages = context.get_messages()
+        known = self._boson_known_messages
+        self._boson_known_messages = {id(message): message for message in messages}
+        if known is None:
+            return [], False
+        if known:
+            last_known = max(
+                (index for index, message in enumerate(messages) if id(message) in known),
+                default=None,
+            )
+            if last_known is None:
+                # Context replaced wholesale: treat as history, not new input.
+                return [], False
+        else:
+            last_known = -1
+
+        appended: list[dict[str, Any]] = []
+        matched_spoken = False
+        for message in messages[last_known + 1 :]:
+            if id(message) in known or not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            text = _normalize_message_text(message.get("content"))
+            if not text:
+                continue
+            if self._consume_server_transcripts(text):
+                matched_spoken = True
+                continue
+            appended.append(message)
+        return appended, matched_spoken
+
+    def _consume_server_transcripts(self, text: str) -> bool:
+        """Match ``text`` to consecutive unmatched server transcripts, and drop them.
+
+        The aggregator joins the transcripts of one spoken turn into one
+        message, so compare ignoring whitespace against runs of them.
+        """
+
+        target = "".join(text.split())
+        transcripts = list(self._boson_server_user_transcripts)
+        for start in range(len(transcripts)):
+            joined = ""
+            for end in range(start, len(transcripts)):
+                joined += "".join(transcripts[end].split())
+                if joined == target:
+                    del transcripts[start : end + 1]
+                    self._boson_server_user_transcripts.clear()
+                    self._boson_server_user_transcripts.extend(transcripts)
+                    return True
+                if not target.startswith(joined):
+                    break
+        return False
 
     async def _send_conversation_messages(self, messages: list[dict[str, Any]]) -> None:
         adapter = self.get_llm_adapter()
@@ -701,6 +828,9 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         item_id = getattr(evt, "item_id", None)
         if item_id and not self._mark_transcription_item_completed(item_id):
             return
+        transcript = _normalize_message_text(getattr(evt, "transcript", None))
+        if transcript:
+            self._boson_server_user_transcripts.append(transcript)
         await super().handle_evt_input_audio_transcription_completed(evt)
 
     async def _handle_evt_speech_stopped(self, evt) -> None:
@@ -1131,6 +1261,16 @@ def _merge_turn_detection(current: dict[str, Any] | None, value: Any) -> dict[st
     if vad_type:
         merged["type"] = vad_type
     return merged
+
+
+def _normalize_message_text(content: Any) -> str:
+    """The text of a message's content (a string or text parts), whitespace-normalized."""
+
+    if isinstance(content, list):
+        content = " ".join(part.get("text", "") for part in content if isinstance(part, dict))
+    if not isinstance(content, str):
+        return ""
+    return " ".join(content.split())
 
 
 def _loads_ws_message(message: Any) -> dict[str, Any]:
