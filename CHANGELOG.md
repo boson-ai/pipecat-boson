@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- Reply to typed text and `LLMMessagesAppendFrame` in a standard pipeline (#20). The user aggregator previously consumed append frames before the service saw them, so playground typed messages and mid-call appends got no Higgs reply. Add `BosonMessagesAppendRelay` before the user aggregator to preserve `run_llm`; without the relay, `run_llm=True` context pushes still create a reply, and deferred `run_llm=False` notes sync without cancelling an in-progress spoken response.
+
 ## [0.1.4] - 2026-10-22
 
 ### Changed

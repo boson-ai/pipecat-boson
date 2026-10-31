@@ -38,7 +38,7 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 from pipecat.workers.runner import WorkerRunner
 
-from pipecat_boson.realtime import BosonRealtimeLLMService
+from pipecat_boson.realtime import BosonMessagesAppendRelay, BosonRealtimeLLMService
 
 
 load_dotenv(override=True)
@@ -272,6 +272,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     pipeline = Pipeline(
         [
             transport.input(),
+            # Preserve run_llm for typed text / LLMMessagesAppendFrame past the aggregator.
+            BosonMessagesAppendRelay(),
             user_aggregator,
             llm,
             transport.output(),
