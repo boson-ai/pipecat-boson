@@ -10,6 +10,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### Fixed
 
 - Support `pipecat-ai` 1.13 to 1.15 alongside 1.4 to 1.12; the cap moves from `<1.13` to `<1.16`. Pipecat 1.13.0 added a `direction` argument to `OpenAIRealtimeLLMService._handle_context` and made `get_llm_invocation_params` async, which broke the service on the first context frame and when sending conversation messages. It also renamed `AggregationType` to `TextType`, which made the reply transcript print deprecation warnings. On 1.13, a tool's progress updates (results with `is_final=False`) are dropped with a warning: Pipecat sends them as system messages, which Boson rejects, and that ended the session.
+- Convert input audio to 24 kHz, the rate the session declares, before sending it to Boson. Previously audio at any other rate, such as Pipecat's default 16 kHz, was sent unchanged on `pipecat-ai` 1.4 to 1.12 but labelled as 24 kHz, which compressed server-side turn-detection timing by the ratio of the two rates, and 8 kHz telephony audio was not detected as speech at all. Pipecat 1.13 converts input itself.
+- An input audio frame with an odd number of bytes no longer stops the session from responding. The split sample at its end is now carried into the next frame. Previously Boson rejected the frame, or on `pipecat-ai` 1.13 converting it raised an error.
+- In manual turn-detection mode, an interruption no longer stops the session from responding at some pre-roll lengths, such as a VAD `start_secs` of 0.15, 0.35 or 0.6. Pipecat can size the replayed speech onset one byte short of a whole sample, and Boson rejected it.
 
 ## [0.1.4] - 2026-10-22
 

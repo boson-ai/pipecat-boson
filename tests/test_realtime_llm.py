@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import inspect
 import json
+import struct
 import warnings
 from types import SimpleNamespace
 
 import pytest
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     AggregatedTextFrame,
     EndFrame,
@@ -19,6 +22,7 @@ from pipecat.frames.frames import (
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
     FunctionCallResultProperties,
+    InputAudioRawFrame,
     InterimTranscriptionFrame,
     InterruptionFrame,
     LLMConfigureOutputFrame,
@@ -28,6 +32,7 @@ from pipecat.frames.frames import (
     LLMMessagesAppendFrame,
     LLMSetToolsFrame,
     LLMTextFrame,
+    SpeechControlParamsFrame,
     TranscriptionFrame,
     TTSTextFrame,
     UserStartedSpeakingFrame,
@@ -47,7 +52,7 @@ from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 import pipecat_boson.realtime.llm as realtime_llm
 from pipecat_boson.realtime import BosonRealtimeLLMService
 from pipecat_boson.realtime._compat import HANDLE_CONTEXT_TAKES_DIRECTION, SENTENCE_TEXT, forget_answered_call
-from pipecat_boson.realtime.config import DEFAULT_TURN_DETECTION
+from pipecat_boson.realtime.config import DEFAULT_TURN_DETECTION, SAMPLE_RATE
 
 
 # pipecat-ai >= 1.8.0 gives run_test() a 1-second default budget for the pipeline
@@ -2224,3 +2229,239 @@ async def test_a_tool_progress_update_in_a_real_pipeline_never_reaches_boson():
     assert [item.get("role") for item in items if item["type"] == "message"] == []
     assert [message["type"] for message in after].count("response.create") == 1
     assert [item["output"] for item in items if item["type"] == "function_call_output"] == [json.dumps({"flights": 3})]
+
+
+def appended_audio(service) -> list[bytes]:
+    return [
+        base64.b64decode(payload["audio"])
+        for payload in service.sent
+        if payload.get("type") == "input_audio_buffer.append"
+    ]
+
+
+def split_bytes(data: bytes, sizes: list[int]) -> list[bytes]:
+    """Cut ``data`` into consecutive chunks, cycling through ``sizes``."""
+    chunks, start = [], 0
+    while start < len(data):
+        size = sizes[len(chunks) % len(sizes)]
+        chunks.append(data[start : start + size])
+        start += size
+    return chunks
+
+
+async def send_audio(service, audio: bytes, sample_rate: int) -> None:
+    await service._send_user_audio(InputAudioRawFrame(audio=audio, sample_rate=sample_rate, num_channels=1))
+
+
+@pytest.mark.parametrize("rate", [8000, 16000, 44100, 48000])
+@pytest.mark.asyncio
+async def test_input_audio_at_another_rate_is_converted_to_24k(rate):
+    # Boson reads every append as the 24 kHz PCM16 that session.update declares. Sent unchanged,
+    # Pipecat's default 16 kHz played 1.5x fast and compressed server VAD timing.
+    service = CapturingBosonRealtimeLLMService()
+
+    for _ in range(10):  # 1 s in 100 ms frames
+        await send_audio(service, b"\x00\x01" * (rate // 10), rate)
+
+    one_second_at_24k = SAMPLE_RATE * 2
+    sent_bytes = sum(len(append) for append in appended_audio(service))
+    assert 0.9 * one_second_at_24k <= sent_bytes <= 1.1 * one_second_at_24k
+    assert {payload["type"] for payload in service.sent} == {"input_audio_buffer.append"}
+
+
+@pytest.mark.asyncio
+async def test_24k_input_audio_is_sent_unchanged():
+    service = CapturingBosonRealtimeLLMService()
+    audio = b"\x00\x01" * 2400  # 100 ms at 24 kHz
+
+    await send_audio(service, audio, SAMPLE_RATE)
+
+    assert appended_audio(service) == [audio]
+    assert service._boson_input_resampler is None
+
+
+@pytest.mark.asyncio
+async def test_input_resampler_survives_a_change_of_incoming_sample_rate():
+    service = CapturingBosonRealtimeLLMService()
+
+    # A stream resampler is pinned to one rate pair; the service must not reuse it
+    # across a change (pipecat raises ValueError in that case).
+    for rate in (44100, 16000, 44100):
+        await send_audio(service, b"\x00\x01" * (rate // 10), rate)
+        assert service.sent[-1]["type"] == "input_audio_buffer.append"
+        assert base64.b64decode(service.sent[-1]["audio"])
+
+    assert service._boson_input_resampler_rate == 44100
+
+
+@pytest.mark.asyncio
+async def test_manual_turn_preroll_buffers_the_audio_that_was_actually_sent():
+    service = CapturingBosonRealtimeLLMService(turn_detection=False)
+
+    chunk = b"\x00\x01" * 4410  # 100 ms at 44.1 kHz
+    await send_audio(service, chunk, 44100)
+
+    sent = appended_audio(service)[-1]
+    # Pre-roll is replayed into the same session on barge-in, so it has to hold the
+    # converted bytes rather than the originals.
+    assert bytes(service._user_audio_preroll_buffer) == sent
+    assert len(sent) < len(chunk)
+
+
+@pytest.mark.asyncio
+async def test_manual_turn_preroll_is_sized_for_the_converted_audio():
+    service = CapturingBosonRealtimeLLMService(turn_detection=False)
+    service._handle_speech_control_params(SpeechControlParamsFrame(vad_params=VADParams(start_secs=0.2)))
+
+    for _ in range(10):  # 1 s at 16 kHz
+        await send_audio(service, b"\x00\x01" * 1600, 16000)
+
+    # Pipecat sizes the pre-roll from the frame's rate, so the converted frame must say 24 kHz:
+    # 0.5 s of it, not 0.5 s worth of 16 kHz bytes.
+    assert len(service._user_audio_preroll_buffer) == int(SAMPLE_RATE * 2 * (0.2 + 0.3))
+
+
+@pytest.mark.asyncio
+async def test_odd_length_frames_reach_boson_as_whole_samples():
+    service = CapturingBosonRealtimeLLMService()
+    stream = bytes(i % 251 for i in range(4800))  # 100 ms at 24 kHz
+
+    # Boson decodes each append on its own and rejects a split sample. The one-byte
+    # frame has nothing whole to send, so it must not produce an empty append.
+    for chunk in split_bytes(stream, [480, 1, 479]):
+        await send_audio(service, chunk, SAMPLE_RATE)
+
+    appends = appended_audio(service)
+    assert all(append and len(append) % 2 == 0 for append in appends)
+    assert b"".join(appends) == stream
+
+
+@pytest.mark.asyncio
+async def test_odd_length_frames_resample_the_same_as_whole_sample_frames():
+    # 48 kHz: a whole-number ratio to 24 kHz keeps the resampler bit-exact
+    # (at 44.1 kHz its output varies by a couple of LSB from run to run).
+    stream = bytes(i % 251 for i in range(19200))  # 200 ms at 48 kHz
+    results = []
+    for sizes in ([1920], [1921, 1919]):
+        service = CapturingBosonRealtimeLLMService()
+        for chunk in split_bytes(stream, sizes):
+            await send_audio(service, chunk, 48000)
+        results.append(b"".join(appended_audio(service)))
+
+    # Dropping the odd byte instead shifted every later sample by one byte.
+    assert results[1] == results[0]
+
+
+@pytest.mark.asyncio
+async def test_a_leftover_byte_is_dropped_when_the_incoming_rate_changes():
+    service = CapturingBosonRealtimeLLMService()
+    audio = b"\x00\x01" * 2400  # 100 ms at 24 kHz
+
+    await send_audio(service, b"\x07" * 4801, 48000)
+    await send_audio(service, audio, SAMPLE_RATE)
+
+    # The leftover half-sample belongs to the 48 kHz stream, not this one.
+    assert appended_audio(service)[-1] == audio
+
+
+def allow_fake_connect(monkeypatch, service) -> None:
+    async def fake_connect(**kwargs):
+        return object()
+
+    async def no_session_update():
+        return None
+
+    monkeypatch.setattr("pipecat_boson.realtime.llm.websocket_connect", fake_connect)
+    monkeypatch.setattr(service, "create_task", lambda coroutine: coroutine.close())
+    monkeypatch.setattr(service, "_send_session_update", no_session_update)
+
+
+@pytest.mark.asyncio
+async def test_a_reconnect_keeps_a_split_sample_from_the_microphone_stream(monkeypatch):
+    # A transport that cuts one continuous stream at odd byte counts leaves half a sample
+    # pending. The microphone keeps going through a reconnect, so the next chunk starts with
+    # the other half; dropping the pending byte would shift every later sample by one byte.
+    service = CapturingBosonRealtimeLLMService()
+    allow_fake_connect(monkeypatch, service)
+    stream = struct.pack("<2400h", *range(2400))  # 100 ms at 24 kHz; each sample is its index
+    chunks = [stream[start : start + 481] for start in range(0, len(stream), 481)]
+
+    for chunk in chunks[:5]:
+        await send_audio(service, chunk, SAMPLE_RATE)
+    assert service._boson_input_leftover  # 5 x 481 bytes leaves half a sample pending
+
+    service._api_session_ready = True
+    await service._mark_websocket_disconnected()  # how the old session ends
+    await service._connect()  # how the next one starts
+    for chunk in chunks[5:]:
+        await send_audio(service, chunk, SAMPLE_RATE)
+
+    assert b"".join(appended_audio(service)) == stream
+
+
+@pytest.mark.asyncio
+async def test_a_reconnect_keeps_the_input_resampler(monkeypatch):
+    # What it holds back is the newest microphone audio, not the old conversation.
+    service = CapturingBosonRealtimeLLMService()
+    allow_fake_connect(monkeypatch, service)
+    await send_audio(service, b"\x00\x01" * 4410, 44100)
+    resampler = service._boson_input_resampler
+
+    service._api_session_ready = True
+    await service._mark_websocket_disconnected()
+    await service._connect()
+
+    assert service._boson_input_resampler is resampler
+    assert service._boson_input_resampler_rate == 44100
+
+
+@pytest.mark.asyncio
+async def test_pausing_audio_input_keeps_a_split_sample_in_step():
+    # Pipecat drops input while audio input is paused, before _send_user_audio sees it.
+    service = CapturingBosonRealtimeLLMService()
+    stream = struct.pack("<4800h", *range(4800))  # 200 ms at 24 kHz; each sample is its index
+    chunks = [stream[start : start + 481] for start in range(0, len(stream), 481)]
+
+    async def feed(chunk):
+        frame = InputAudioRawFrame(audio=chunk, sample_rate=SAMPLE_RATE, num_channels=1)
+        await service.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+    for chunk in chunks[:5]:
+        await feed(chunk)
+    service.set_audio_input_paused(True)
+    await feed(chunks[5])  # 481 bytes dropped: an odd count
+    service.set_audio_input_paused(False)
+    sent_before = len(appended_audio(service))
+    for chunk in chunks[6:]:
+        await feed(chunk)
+
+    after = b"".join(appended_audio(service)[sent_before:])
+    first = 6 * 481 // 2  # the first whole sample after the dropped chunk
+    assert after == stream[2 * first : 2 * first + len(after)]
+
+
+@pytest.mark.parametrize(
+    ("start_secs", "replayed_bytes"),
+    [
+        (0.15, 21598),  # Pipecat sizes the pre-roll as int(24000 * 2 * (0.15 + 0.3)) = 21599 bytes
+        (0.2, 24000),  # int(24000 * 2 * (0.2 + 0.3)) = 24000 bytes is already whole samples
+    ],
+)
+@pytest.mark.asyncio
+async def test_preroll_replay_after_an_interruption_starts_on_a_sample_boundary(start_secs, replayed_bytes):
+    service = CapturingBosonRealtimeLLMService(turn_detection=False)
+    service._handle_speech_control_params(SpeechControlParamsFrame(vad_params=VADParams(start_secs=start_secs)))
+    for _ in range(50):  # 1 s at 24 kHz, every sample 00 01
+        await send_audio(service, b"\x00\x01" * 480, SAMPLE_RATE)
+
+    mark = len(service.sent)
+    await service._handle_interruption()
+
+    assert [payload["type"] for payload in service.sent[mark:]][:2] == [
+        "input_audio_buffer.clear",
+        "input_audio_buffer.append",
+    ]
+    # Boson rejects an odd append, and a replay that starts mid-sample is noise.
+    # Only an odd pre-roll loses its first byte.
+    replay = base64.b64decode(service.sent[mark + 1]["audio"])
+    assert replay == b"\x00\x01" * (replayed_bytes // 2)

@@ -125,6 +125,16 @@ logged as expected rather than surfaced as an error frame.
   `system` with a 400, which `_handle_error_event` treats as fatal. Pipecat 1.13 sends
   a tool's progress updates as system items, so `_handle_function_call_result` drops
   them (`accepts_intermediate_function_call_results` is `False`).
+- Input audio: `session.update` always declares 24 kHz, and `_send_user_audio`
+  converts any other rate to it before handing the frame to Pipecat. Pipecat 1.13
+  converts input too, but skips a frame that is already 24 kHz, so it never runs twice.
+- Every `input_audio_buffer.append` must hold whole PCM16 samples: Boson rejects
+  an odd byte count with a 400 that the client treats as fatal. `_send_user_audio`
+  carries a split sample into the next frame, and `_replay_user_audio_preroll`
+  drops a leading half sample. The resampler and a carried half sample belong to
+  the input stream, not the Boson session: they survive a reconnect and reset only
+  when the input rate changes. Input Pipecat drops while audio input is paused
+  still goes through the split in `process_frame`, so the half sample stays in step.
 
 ## Conventions
 
