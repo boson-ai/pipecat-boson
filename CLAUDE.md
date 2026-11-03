@@ -133,7 +133,7 @@ logged as expected rather than surfaced as an error frame.
 - Public entry point is `from pipecat_boson.realtime import BosonRealtimeLLMService`;
   it is lazily imported via `__getattr__` in `realtime/__init__.py` so importing
   the package doesn't pull Pipecat until the service is actually used.
-- Targets `pipecat-ai>=1.4.0,<1.15` and Python 3.11+. Raise the cap only after a new
+- Targets `pipecat-ai>=1.4.0,<1.16` and Python 3.11+. Raise the cap only after a new
   Pipecat minor passes the suite. CI tests the newest Pipecat the cap allows plus
   the older versions listed in the `compat` job in `.github/workflows/ci.yml`.
 - `_compat.py` keeps one fallback per Pipecat version difference, such as
