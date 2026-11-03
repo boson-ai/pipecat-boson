@@ -2338,8 +2338,6 @@ async def test_odd_length_frames_reach_boson_as_whole_samples():
 
 @pytest.mark.asyncio
 async def test_odd_length_frames_resample_the_same_as_whole_sample_frames():
-    # 48 kHz: a whole-number ratio to 24 kHz keeps the resampler bit-exact
-    # (at 44.1 kHz its output varies by a couple of LSB from run to run).
     stream = bytes(i % 251 for i in range(19200))  # 200 ms at 48 kHz
     results = []
     for sizes in ([1920], [1921, 1919]):
@@ -2348,8 +2346,11 @@ async def test_odd_length_frames_resample_the_same_as_whole_sample_frames():
             await send_audio(service, chunk, 48000)
         results.append(b"".join(appended_audio(service)))
 
-    # Dropping the odd byte instead shifted every later sample by one byte.
-    assert results[1] == results[0]
+    # Chunked differently, the resampler can round a sample one step apart (seen on Linux
+    # with pipecat-ai 1.4.0); a one-byte shift instead changes samples by hundreds.
+    whole, odd = (struct.unpack(f"<{len(result) // 2}h", result) for result in results)
+    assert len(odd) == len(whole)
+    assert max(abs(a - b) for a, b in zip(odd, whole)) <= 2
 
 
 @pytest.mark.asyncio
