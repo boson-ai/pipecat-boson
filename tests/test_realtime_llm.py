@@ -169,6 +169,24 @@ class TerminalThenClosedWebSocket(FakeWebSocket):
         raise ConnectionClosedError(None, None, None)
 
 
+class ScriptedWebSocket(FakeWebSocket):
+    """Yields the given events in order, then ends; counts how many were read."""
+
+    def __init__(self, *events: dict):
+        super().__init__()
+        self._messages = [json.dumps(event) for event in events]
+        self.reads = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.reads == len(self._messages):
+            raise StopAsyncIteration
+        self.reads += 1
+        return self._messages[self.reads - 1]
+
+
 def make_error_event(error_type: str, message: str = "", code: str | None = None) -> dict:
     error: dict = {"type": error_type, "message": message}
     if code is not None:
@@ -734,16 +752,32 @@ async def test_conversation_item_not_found_without_pending_retrieve_is_nonfatal(
 
 
 @pytest.mark.asyncio
-async def test_unhandled_error_event_stops_receive_loop():
+async def test_unknown_error_event_pushes_an_error_and_keeps_the_receive_loop():
     service = CapturingBosonRealtimeLLMService()
 
     should_continue = await service._dispatch_boson_server_event(
         make_error_event("invalid_request_error", "Bad request.", code="invalid_value")
     )
 
-    assert should_continue is False
+    assert should_continue is True
     assert len(service.errors) == 1
     assert "Bad request" in service.errors[0]
+
+
+@pytest.mark.asyncio
+async def test_session_terminated_error_stops_receive_loop():
+    service = CapturingBosonRealtimeLLMService()
+
+    should_continue = await service._dispatch_boson_server_event(
+        make_error_event(
+            "invalid_request_error",
+            "Session terminated due to Error while handling session update: bad max_output_tokens",
+            code="400",
+        )
+    )
+
+    assert should_continue is False
+    assert len(service.errors) == 1
 
 
 @pytest.mark.asyncio
@@ -1278,6 +1312,133 @@ async def test_receive_task_terminal_session_events_suppress_unexpected_close_er
     assert service._websocket is None
     assert service._api_session_ready is False
     assert service.metrics_stopped is True
+
+
+# Error events copied from Boson's server: it keeps the session after each of these.
+# (error, ErrorFrames expected): a failed response (upstream, rate limit, context length)
+# is reported by the failed response.done that follows, so its error only logs a warning.
+_ERRORS_BOSON_RECOVERS_FROM = {
+    "rejected client event": (
+        {"type": "", "code": "400", "message": "Error while processing client event: not a whole number of frames"},
+        1,
+    ),
+    "rejected session update": (
+        {
+            "type": "invalid_request_error",
+            "code": "400",
+            "message": "turn_detection cannot be changed after session start",
+        },
+        1,
+    ),
+    "unknown event type": ({"type": "", "code": "400", "message": "Unknown event type: x"}, 1),
+    "commit too short": (
+        {
+            "type": "invalid_request_error",
+            "code": "input_audio_buffer_commit_empty",
+            "message": "Error committing input audio buffer: buffer too small.",
+        },
+        1,
+    ),
+    "upstream failure": (
+        {
+            "type": "server_error",
+            "code": "upstream_error",
+            "message": "The response failed because an upstream service call did not complete.",
+        },
+        0,
+    ),
+    "rate limit": (
+        {
+            "type": "rate_limit_error",
+            "code": "rate_limit_exceeded",
+            "message": "The response failed because the API key exceeded its rate limit for this model.",
+        },
+        0,
+    ),
+    "context length": (
+        {
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "message": "The conversation is too long for the model (140000 tokens; the limit is 128000) and "
+            "truncation is disabled. Delete items or enable truncation.",
+        },
+        0,
+    ),
+    "no user input": ({"type": "", "code": "400", "message": "No user input"}, 0),
+}
+
+# Boson ends the session after these, then closes the websocket.
+_ERRORS_BOSON_ENDS_THE_SESSION_ON = {
+    "session terminated": {
+        "type": "invalid_request_error",
+        "code": "400",
+        "message": "Session terminated due to Error while handling session update: bad max_output_tokens",
+    },
+    "billing refused": {
+        "type": "insufficient_quota",
+        "code": "monthly_cap_reached",
+        "message": "The BosonAI API refused service for billing reasons. Please check your billing status at Boson.ai.",
+    },
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "error_frames"), _ERRORS_BOSON_RECOVERS_FROM.values(), ids=_ERRORS_BOSON_RECOVERS_FROM.keys()
+)
+async def test_receive_task_keeps_reading_after_an_error_boson_recovers_from(error: dict, error_frames: int):
+    service = CapturingErrorBosonRealtimeLLMService()
+    websocket = ScriptedWebSocket({"type": "error", "error": error}, {"type": "session.updated"})
+    service._websocket = websocket
+    service._api_session_ready = True
+
+    await service._receive_task_handler()
+
+    assert websocket.reads == 2
+    assert len(service.errors) == error_frames
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error", _ERRORS_BOSON_ENDS_THE_SESSION_ON.values(), ids=_ERRORS_BOSON_ENDS_THE_SESSION_ON.keys()
+)
+async def test_receive_task_stops_after_an_error_boson_ends_the_session_on(error: dict):
+    service = CapturingErrorBosonRealtimeLLMService()
+    websocket = ScriptedWebSocket({"type": "error", "error": error}, {"type": "session.updated"})
+    service._websocket = websocket
+    service._api_session_ready = True
+
+    await service._receive_task_handler()
+
+    assert websocket.reads == 1
+    assert len(service.errors) == 1
+    assert websocket.closed is True
+
+
+@pytest.mark.asyncio
+async def test_receive_task_reports_a_failed_response_once_and_keeps_reading():
+    service = CapturingErrorBosonRealtimeLLMService()
+    message = "The response failed because an upstream service call did not complete."
+    websocket = ScriptedWebSocket(
+        {"type": "error", "error": {"type": "server_error", "code": "upstream_error", "message": message}},
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp_failed",
+                "status": "failed",
+                "status_details": {"error": {"code": "upstream_error", "message": message}},
+                "output": [],
+            },
+        },
+        {"type": "session.updated"},
+    )
+    service._websocket = websocket
+    service._api_session_ready = True
+
+    await service._receive_task_handler()
+
+    assert websocket.reads == 3
+    assert service.errors == [message]
 
 
 @pytest.mark.asyncio

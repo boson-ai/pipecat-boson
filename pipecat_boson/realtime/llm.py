@@ -75,8 +75,7 @@ _BOSON_TERMINAL_SESSION_EVENT_TYPES = {
     "session.max_duration_reached",
 }
 
-# Boson rejects some client events per-request while the session stays healthy.
-# These errors must not kill the receive loop.
+# Errors a healthy session produces: log a warning, no ErrorFrame.
 _BOSON_NONFATAL_ERROR_TYPES = {
     "conversation_item_not_found",
     "invalid_previous_item_id",
@@ -85,13 +84,22 @@ _BOSON_NONFATAL_ERROR_TYPES = {
 
 _BOSON_NONFATAL_ERROR_CODES = {
     "response_id_mismatch",
+    # These fail a response; the failed response.done that follows reports them.
+    "upstream_error",
+    "rate_limit_exceeded",
+    "context_length_exceeded",
 }
 
-# Some request-level Boson errors currently arrive with only code="400" and a
-# human-readable message. Keep this allow-list narrow so unrelated bad requests
-# remain fatal to the realtime session.
 _BOSON_NONFATAL_400_MESSAGES = {
     "No user input",
+}
+
+# Boson ends the session after these errors, then closes the websocket; any other error
+# rejects one request. A session-ending 400 shares its type and code with those, so only
+# the message tells them apart.
+_BOSON_SESSION_ENDING_400_PREFIX = "Session terminated due to "
+_BOSON_SESSION_ENDING_ERROR_TYPES = {
+    "insufficient_quota",
 }
 
 _BOSON_SERVER_EVENT_HANDLERS = {
@@ -809,7 +817,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         return True
 
     async def _handle_error_event(self, evt) -> bool:
-        """Handle a Boson error event. Returns False when the error is fatal."""
+        """Handle a Boson error event. Returns False when Boson ends the session on it."""
 
         error = getattr(evt, "error", None)
         error_type = getattr(error, "type", None) if error is not None else None
@@ -841,7 +849,10 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             return True
 
         await self._handle_evt_error(evt)
-        return False
+        ends_session = error_type in _BOSON_SESSION_ENDING_ERROR_TYPES or message.startswith(
+            _BOSON_SESSION_ENDING_400_PREFIX
+        )
+        return not ends_session
 
     def _fail_pending_conversation_item_retrievals(self, error: Any, message: str) -> None:
         # Boson retrieve errors do not echo the client's "rci_{item_id}" event_id,
