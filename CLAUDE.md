@@ -114,27 +114,33 @@ logged as expected rather than surfaced as an error frame.
   (the base class appends one; `__init__` overwrites `base_url` afterward).
 - `response.create` payloads: `output_modalities` is rewritten to `modalities`
   by `_normalize_response_create_payload` before send.
-- Turn detection is fixed once the session starts: Boson rejects any later
-  change except `create_response` / `interrupt_response`, and that rejection is
-  fatal in `_handle_error_event`. While connected, `_sync_boson_settings_from_pipecat`
-  ignores turn-detection changes with a warning (the two flags have no effect yet).
+- Turn detection is fixed once the session starts: Boson answers any later change
+  except `create_response` / `interrupt_response` with a 400. While connected,
+  `_sync_boson_settings_from_pipecat` ignores turn-detection changes with a warning
+  (the two flags have no effect yet).
 - A `turn_detection` payload without a `type` is server VAD on Boson.
 - `SimpleNamespace`-based attribute access (`_to_attr`) is used to read incoming
   JSON events uniformly.
+- An `error` event rejects one request, and Boson keeps the session, except after a
+  400 `Session terminated due to …` or an `insufficient_quota` error, when it closes
+  the websocket. The session-ending 400 has the same type and code as a recoverable
+  one, so only its message tells them apart. `_handle_error_event` stops the receive
+  loop only on those two, logs a warning for the `_BOSON_NONFATAL_*` errors, and
+  pushes a non-fatal `ErrorFrame` for the rest.
 - Boson accepts only `user` and `assistant` message items from a client and rejects
-  `system` with a 400, which `_handle_error_event` treats as fatal. Pipecat 1.13 sends
-  a tool's progress updates as system items, so `_handle_function_call_result` drops
-  them (`accepts_intermediate_function_call_results` is `False`).
+  `system` with a 400. Pipecat 1.13 sends a tool's progress updates as system items,
+  so `_handle_function_call_result` drops them
+  (`accepts_intermediate_function_call_results` is `False`).
 - Input audio: `session.update` always declares 24 kHz, and `_send_user_audio`
   converts any other rate to it before handing the frame to Pipecat. Pipecat 1.13
   converts input too, but skips a frame that is already 24 kHz, so it never runs twice.
 - Every `input_audio_buffer.append` must hold whole PCM16 samples: Boson rejects
-  an odd byte count with a 400 that the client treats as fatal. `_send_user_audio`
-  carries a split sample into the next frame, and `_replay_user_audio_preroll`
-  drops a leading half sample. The resampler and a carried half sample belong to
-  the input stream, not the Boson session: they survive a reconnect and reset only
-  when the input rate changes. Input Pipecat drops while audio input is paused
-  still goes through the split in `process_frame`, so the half sample stays in step.
+  an odd byte count with a 400. `_send_user_audio` carries a split sample into the
+  next frame, and `_replay_user_audio_preroll` drops a leading half sample. The
+  resampler and a carried half sample belong to the input stream, not the Boson
+  session: they survive a reconnect and reset only when the input rate changes.
+  Input Pipecat drops while audio input is paused still goes through the split in
+  `process_frame`, so the half sample stays in step.
 
 ## Conventions
 
