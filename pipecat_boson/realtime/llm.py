@@ -117,6 +117,7 @@ _BOSON_IGNORED_SERVER_EVENT_TYPES = {
     "conversation.created",
     "conversation.item.deleted",
     "conversation.item.truncated",
+    "conversation.item.done",
     "input_audio_buffer.committed",
     "input_audio_buffer.cleared",
     "response.output_item.done",

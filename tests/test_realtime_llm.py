@@ -548,6 +548,24 @@ async def test_input_audio_transcription_failed_logs_warning_and_continues(monke
 
 
 @pytest.mark.asyncio
+async def test_conversation_item_done_is_ignored_without_unsupported_log(monkeypatch):
+    service = CapturingBosonRealtimeLLMService()
+    debug_lines = []
+    monkeypatch.setattr(realtime_llm.logger, "debug", debug_lines.append)
+
+    should_continue = await service._dispatch_boson_server_event(
+        {
+            "type": "conversation.item.done",
+            "previous_item_id": None,
+            "item": {"id": "item_1", "object": "realtime.item", "type": "message", "role": "assistant"},
+        }
+    )
+
+    assert should_continue is True
+    assert debug_lines == []
+
+
+@pytest.mark.asyncio
 async def test_messages_append_cancels_active_response_before_creating_text_response():
     service = CapturingBosonRealtimeLLMService()
     service._api_session_ready = True
