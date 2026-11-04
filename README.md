@@ -360,7 +360,8 @@ Optional session settings supported by Higgs Realtime:
 | `input_audio_noise_reduction` | Not set | OpenAI-compatible `{"type": "near_field"}` or `{"type": "far_field"}` input noise reduction setting. The corresponding type string is also accepted. |
 | `truncation` | `"auto"` | `"auto"` enables smart context summarization when the selected model publishes a context limit; `"disabled"` turns it off. |
 
-This Pipecat integration sends and receives 24 kHz PCM audio.
+This Pipecat integration sends and receives 24 kHz PCM audio. Input audio at any
+other rate, such as Pipecat's default 16 kHz, is converted to 24 kHz before it is sent.
 
 ## Next steps
 
