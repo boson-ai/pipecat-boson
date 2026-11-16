@@ -1365,6 +1365,15 @@ _ERRORS_BOSON_RECOVERS_FROM = {
         0,
     ),
     "no user input": ({"type": "", "code": "400", "message": "No user input"}, 0),
+    "speech in progress": (
+        {
+            "type": "invalid_request_error",
+            "code": "user_speech_in_progress",
+            "message": "The user is still speaking. Their audio will be added to the conversation, "
+            "and the next response will include it.",
+        },
+        0,
+    ),
 }
 
 # Boson ends the session after these, then closes the websocket.

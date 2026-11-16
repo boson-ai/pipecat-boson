@@ -84,7 +84,10 @@ _BOSON_NONFATAL_ERROR_TYPES = {
 
 _BOSON_NONFATAL_ERROR_CODES = {
     "response_id_mismatch",
-    # These fail a response; the failed response.done that follows reports them.
+    # Boson refuses a response.create while the caller is still speaking; the next response answers them.
+    "user_speech_in_progress",
+    # These fail a response; the failed response.done that follows reports them. A rate limit at
+    # connect time has no response: Boson closes the socket with 4429, and the close is reported.
     "upstream_error",
     "rate_limit_exceeded",
     "context_length_exceeded",
