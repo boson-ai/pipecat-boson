@@ -95,6 +95,8 @@ from pipecat.workers.runner import WorkerRunner
 
 
 async def run_bot(transport, llm):
+    from pipecat_boson.realtime import BosonMessagesAppendRelay
+
     context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
@@ -104,6 +106,8 @@ async def run_bot(transport, llm):
     pipeline = Pipeline(
         [
             transport.input(),
+            # Keep run_llm for typed text / LLMMessagesAppendFrame past the aggregator.
+            BosonMessagesAppendRelay(),
             user_aggregator,
             llm,
             transport.output(),
@@ -126,6 +130,14 @@ async def run_bot(transport, llm):
 `realtime_service_mode=True` lets the context aggregators follow the
 server-driven turn lifecycle. Do not add separate STT or TTS services around
 `BosonRealtimeLLMService`.
+
+Place `BosonMessagesAppendRelay` immediately before the user aggregator whenever
+the pipeline may receive typed text (Pipecat playground / RTVI `send-text`) or
+an application `LLMMessagesAppendFrame`. The aggregator consumes append frames
+and only pushes an updated context when `run_llm` is true; the relay forwards a
+`BosonMessagesAppendIntent` so the service still sees `run_llm` and can reply
+(`run_llm=True`) or sync a note without interrupting speech (`run_llm=False`).
+Typed text needs the relay; without it those appends never reach the service.
 
 Call `run_bot(transport, llm)` from your application's async entry point.
 

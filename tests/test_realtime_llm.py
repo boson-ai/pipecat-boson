@@ -50,7 +50,11 @@ from pipecat.utils import deprecation as pipecat_deprecation
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 import pipecat_boson.realtime.llm as realtime_llm
-from pipecat_boson.realtime import BosonRealtimeLLMService
+from pipecat_boson.realtime import (
+    BosonMessagesAppendIntent,
+    BosonMessagesAppendRelay,
+    BosonRealtimeLLMService,
+)
 from pipecat_boson.realtime._compat import HANDLE_CONTEXT_TAKES_DIRECTION, SENTENCE_TEXT, forget_answered_call
 from pipecat_boson.realtime.config import DEFAULT_TURN_DETECTION, SAMPLE_RATE
 
@@ -2484,3 +2488,306 @@ async def test_preroll_replay_after_an_interruption_starts_on_a_sample_boundary(
     # Only an odd pre-roll loses its first byte.
     replay = base64.b64decode(service.sent[mark + 1]["audio"])
     assert replay == b"\x00\x01" * (replayed_bytes // 2)
+
+
+def _ready_service_with_context(messages: list[dict]):
+    service = CapturingBosonRealtimeLLMService()
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    context = LLMContext(list(messages))
+    service._context = context
+    service._remember_context_messages(context)
+    return service, context
+
+
+def _sent_message_texts(service, since: int) -> list[str]:
+    return [
+        event["item"]["content"][0]["text"]
+        for event in service.sent[since:]
+        if event["type"] == "conversation.item.create" and event["item"].get("type") == "message"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_typed_text_without_relay_warns_once_and_does_not_reply():
+    service, context = _ready_service_with_context([{"role": "assistant", "content": "Hi there."}])
+    context.add_messages([{"role": "user", "content": "What is the capital of Italy?"}])
+    sent = len(service.sent)
+
+    await service._handle_context(context)
+    assert service._boson_warned_unrelayed_append
+    await service._handle_context(context)
+
+    assert len(service.sent) == sent
+    assert service._boson_warned_unrelayed_append
+
+
+@pytest.mark.asyncio
+async def test_spoken_turn_written_back_to_the_context_does_not_warn():
+    service, context = _ready_service_with_context([])
+    await service.handle_evt_input_audio_transcription_completed(
+        SimpleNamespace(
+            type="conversation.item.input_audio_transcription.completed",
+            item_id="item_1",
+            content_index=0,
+            transcript="What is the capital of Italy?",
+        )
+    )
+    context.add_messages([{"role": "user", "content": "What is the capital of  Italy?"}])
+    sent = len(service.sent)
+
+    await service._handle_context(context)
+
+    assert len(service.sent) == sent
+    assert not service._boson_warned_unrelayed_append
+
+
+@pytest.mark.asyncio
+async def test_spoken_turn_joined_from_several_transcripts_does_not_warn():
+    service, context = _ready_service_with_context([])
+    for item_id, transcript in (("item_1", "What is the capital"), ("item_2", "of Italy?")):
+        await service.handle_evt_input_audio_transcription_completed(
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                item_id=item_id,
+                content_index=0,
+                transcript=transcript,
+            )
+        )
+    context.add_messages([{"role": "user", "content": "What is the capital of Italy?"}])
+
+    await service._handle_context(context)
+
+    assert not service._boson_server_user_transcripts
+    assert not service._boson_warned_unrelayed_append
+
+
+@pytest.mark.asyncio
+async def test_unrelayed_note_with_spoken_turn_does_not_cancel_reply():
+    # Without the relay a deferred note only arrives on the next context push.
+    # Do not invent a sync/cancel from that push (#11).
+    NOTE = {"role": "user", "content": "For reference, my order number is 42."}
+    service, context = _ready_service_with_context([{"role": "assistant", "content": "Hi there."}])
+    context.add_messages([dict(NOTE)])
+
+    service._boson_active_response_ids.add("resp_1")
+    await service.handle_evt_input_audio_transcription_completed(
+        SimpleNamespace(
+            type="conversation.item.input_audio_transcription.completed",
+            item_id="item_1",
+            content_index=0,
+            transcript="What is my order number?",
+        )
+    )
+    context.add_messages([{"role": "user", "content": "What is my order number?"}])
+    sent_before = len(service.sent)
+
+    await service._handle_context(context)
+
+    assert service.sent[sent_before:] == []
+    assert "resp_1" in service._boson_active_response_ids
+    assert service._boson_warned_unrelayed_append
+
+
+@pytest.mark.asyncio
+async def test_append_intent_run_llm_true_sends_and_creates_response():
+    service, context = _ready_service_with_context([])
+    message = {"role": "user", "content": "hello from relay"}
+
+    await service.process_frame(
+        BosonMessagesAppendIntent(messages=[message], run_llm=True),
+        FrameDirection.DOWNSTREAM,
+    )
+
+    assert [event["type"] for event in service.sent[-2:]] == [
+        "conversation.item.create",
+        "response.create",
+    ]
+    assert id(message) in service._boson_known_messages
+
+    # A later context push that includes the same message must not double-send.
+    context.add_messages([message])
+    sent = len(service.sent)
+    await service._handle_context(context)
+    assert len(service.sent) == sent
+
+
+@pytest.mark.asyncio
+async def test_append_intent_run_llm_false_sends_without_creating_response():
+    service, _context = _ready_service_with_context([])
+    service._boson_active_response_ids.add("resp_active")
+
+    await service.process_frame(
+        BosonMessagesAppendIntent(
+            messages=[{"role": "user", "content": "quiet note"}],
+            run_llm=False,
+        ),
+        FrameDirection.DOWNSTREAM,
+    )
+
+    assert service.sent[-1]["type"] == "conversation.item.create"
+    assert service.sent[-1]["item"]["content"][0]["text"] == "quiet note"
+    assert not any(event["type"] == "response.create" for event in service.sent[-2:])
+    assert not any(event["type"] == "response.cancel" for event in service.sent)
+    assert "resp_active" in service._boson_active_response_ids
+
+
+@pytest.mark.asyncio
+async def test_append_intent_before_context_is_a_no_op():
+    service = CapturingBosonRealtimeLLMService()
+    service._api_session_ready = True
+
+    await service.process_frame(
+        BosonMessagesAppendIntent(messages=[{"role": "user", "content": "early"}], run_llm=True),
+        FrameDirection.DOWNSTREAM,
+    )
+
+    assert service.sent == []
+    assert service._boson_pending_message_appends == []
+
+
+@pytest.mark.asyncio
+async def test_relay_emits_intent_then_original_append():
+    relay = BosonMessagesAppendRelay()
+    pushed: list = []
+
+    async def capture(frame, direction=FrameDirection.DOWNSTREAM):
+        pushed.append(frame)
+
+    relay.push_frame = capture  # type: ignore[method-assign]
+    message = {"role": "user", "content": "typed"}
+    frame = LLMMessagesAppendFrame(messages=[message], run_llm=True)
+
+    await relay.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+    assert len(pushed) == 2
+    assert isinstance(pushed[0], BosonMessagesAppendIntent)
+    assert pushed[0].messages is frame.messages
+    assert pushed[0].messages[0] is message
+    assert pushed[0].run_llm is True
+    assert pushed[1] is frame
+
+
+@pytest.mark.asyncio
+async def test_real_user_aggregator_pushes_context_only_when_run_llm():
+    NOTE = {"role": "user", "content": "For reference, my order number is 42."}
+    context = LLMContext([{"role": "assistant", "content": "Hi there."}])
+    user = LLMContextAggregatorPair(context).user()
+
+    for run_llm in (False, True):
+        down, _ = await run_test(
+            user,
+            frames_to_send=[LLMMessagesAppendFrame(messages=[dict(NOTE)], run_llm=run_llm)],
+            expected_down_frames=None,
+            **RUN_TEST_START_KWARGS,
+        )
+        assert any(isinstance(frame, LLMContextFrame) for frame in down) is run_llm
+
+
+@pytest.mark.asyncio
+async def test_direct_append_is_not_resent_or_warned_on_later_context():
+    service, context = _ready_service_with_context([])
+    await service._handle_messages_append(
+        LLMMessagesAppendFrame(messages=[{"role": "user", "content": "hello"}], run_llm=True)
+    )
+    sent = len(service.sent)
+
+    await service._handle_context(context)
+
+    assert _sent_message_texts(service, sent) == []
+    assert not service._boson_warned_unrelayed_append
+
+
+@pytest.mark.asyncio
+async def test_replaced_context_does_not_resend_old_messages():
+    service, context = _ready_service_with_context(
+        [{"role": "user", "content": "a"}, {"role": "user", "content": "b"}]
+    )
+    context.set_messages([{"role": "user", "content": "a"}])
+    sent = len(service.sent)
+
+    await service._handle_context(context)
+
+    assert not [event for event in service.sent[sent:] if event["type"] == "conversation.item.create"]
+
+
+@contextlib.asynccontextmanager
+async def running_append_pipeline(service, context):
+    """Relay → real user aggregator → service, for typed-text e2e coverage."""
+
+    pair = LLMContextAggregatorPair(context)
+    task = PipelineTask(Pipeline([BosonMessagesAppendRelay(), pair.user(), service, pair.assistant()]))
+    runner = asyncio.create_task(PipelineRunner(handle_sigint=False).run(task))
+    try:
+        await wait_until(lambda: service._api_session_ready)
+        yield task
+    finally:
+        await task.queue_frame(EndFrame())
+        await asyncio.wait_for(runner, 10)
+
+
+@pytest.mark.asyncio
+async def test_relay_pipeline_append_before_context_creates_one_response():
+    service = PipelineBosonService()
+    context = LLMContext()
+
+    async with running_append_pipeline(service, context) as task:
+        await task.queue_frame(
+            LLMMessagesAppendFrame(messages=[{"role": "user", "content": "hello before context"}], run_llm=True)
+        )
+        await wait_until(lambda: sent_types(service).count("response.create") == 1)
+        await asyncio.sleep(0.2)
+
+    assert sent_types(service).count("response.create") == 1
+    assert [text for text in _sent_message_texts(service, 0) if text == "hello before context"] == [
+        "hello before context"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_relay_pipeline_run_llm_true_creates_exactly_one_response():
+    service = PipelineBosonService()
+    context = LLMContext([{"role": "assistant", "content": "Hi there."}])
+
+    async with running_append_pipeline(service, context) as task:
+        await task.queue_frame(LLMContextFrame(context))
+        await wait_until(lambda: "response.create" in sent_types(service))
+        before = len(service.sent)
+        await task.queue_frame(
+            LLMMessagesAppendFrame(
+                messages=[{"role": "user", "content": "What is the capital of Italy?"}], run_llm=True
+            )
+        )
+        await wait_until(lambda: "response.create" in sent_types(service)[before:])
+        await asyncio.sleep(0.2)
+
+    after = service.sent[before:]
+    assert [event["type"] for event in after] == [
+        "response.cancel",
+        "conversation.item.create",
+        "response.create",
+    ]
+    assert after[1]["item"]["content"][0]["text"] == "What is the capital of Italy?"
+
+
+@pytest.mark.asyncio
+async def test_relay_pipeline_run_llm_false_syncs_without_response():
+    service = PipelineBosonService()
+    context = LLMContext([{"role": "assistant", "content": "Hi there."}])
+
+    async with running_append_pipeline(service, context) as task:
+        await task.queue_frame(LLMContextFrame(context))
+        await wait_until(lambda: "response.create" in sent_types(service))
+        before = len(service.sent)
+        await task.queue_frame(
+            LLMMessagesAppendFrame(
+                messages=[{"role": "user", "content": "For reference, my order number is 42."}],
+                run_llm=False,
+            )
+        )
+        await wait_until(lambda: any(event["type"] == "conversation.item.create" for event in service.sent[before:]))
+        await asyncio.sleep(0.2)
+
+    after = service.sent[before:]
+    assert [event["type"] for event in after] == ["conversation.item.create"]
+    assert after[0]["item"]["content"][0]["text"] == "For reference, my order number is 42."
