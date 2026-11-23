@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+- Log a Boson Realtime event type the service does not handle as a warning, once per type, instead of at debug level on every event, so a new server event shows up at the usual INFO level. The service now also ignores `response.latency.completed`, which the server can send with per-turn latency figures.
+
 ### Fixed
 
 - Reply to typed text and `LLMMessagesAppendFrame` in a standard pipeline (#20). The user aggregator previously consumed append frames before the service saw them, so playground typed messages and mid-call appends got no Higgs reply. Place `BosonMessagesAppendRelay` immediately before the user aggregator so `run_llm` reaches the service; without it, a context push with a new typed user message logs a one-time warning and does not invent a reply.

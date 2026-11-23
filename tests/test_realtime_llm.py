@@ -570,21 +570,41 @@ async def test_input_audio_transcription_failed_logs_warning_and_continues(monke
 
 
 @pytest.mark.asyncio
-async def test_conversation_item_done_is_ignored_without_unsupported_log(monkeypatch):
-    service = CapturingBosonRealtimeLLMService()
-    debug_lines = []
-    monkeypatch.setattr(realtime_llm.logger, "debug", debug_lines.append)
-
-    should_continue = await service._dispatch_boson_server_event(
+@pytest.mark.parametrize(
+    "event",
+    [
         {
             "type": "conversation.item.done",
             "previous_item_id": None,
             "item": {"id": "item_1", "object": "realtime.item", "type": "message", "role": "assistant"},
-        }
-    )
+        },
+        {"type": "response.latency.completed", "response_id": "resp_1", "total_ms": 420},
+    ],
+)
+async def test_known_unused_events_are_ignored_without_warning(monkeypatch, event):
+    service = CapturingBosonRealtimeLLMService()
+    warnings = []
+    monkeypatch.setattr(realtime_llm.logger, "warning", warnings.append)
+
+    should_continue = await service._dispatch_boson_server_event(event)
 
     assert should_continue is True
-    assert debug_lines == []
+    assert warnings == []
+
+
+@pytest.mark.asyncio
+async def test_unsupported_event_type_warns_once_per_type(monkeypatch):
+    service = CapturingBosonRealtimeLLMService()
+    warnings = []
+    monkeypatch.setattr(realtime_llm.logger, "warning", warnings.append)
+
+    for event_type in ("response.future_event", "response.future_event", "response.other_event"):
+        assert await service._dispatch_boson_server_event({"type": event_type}) is True
+
+    assert warnings == [
+        "Ignoring unsupported Boson realtime event type: response.future_event",
+        "Ignoring unsupported Boson realtime event type: response.other_event",
+    ]
 
 
 @pytest.mark.asyncio
