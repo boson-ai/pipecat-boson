@@ -301,6 +301,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         self._boson_server_call_ids: deque[str] = deque(maxlen=_BOSON_TRANSCRIPTION_DEDUP_CACHE_SIZE)
         self._boson_terminal_session_event_type: str | None = None
         self._boson_response_start_frame_active = False
+        self._boson_tts_started = False
 
         if session_tools is not None:
             self._sync_registered_tool_handlers(session_tools)
@@ -872,7 +873,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         should_push_end = (
             self._boson_response_start_frame_active
             or self._current_assistant_response is not None
-            or self._current_audio_response is not None
+            or self._boson_tts_started
         )
         if not should_push_end:
             self._current_assistant_response = None
@@ -881,12 +882,13 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             return
 
         await self.stop_processing_metrics()
-        if self._current_audio_response is not None:
+        if self._boson_tts_started:
             await self.push_frame(TTSStoppedFrame())
         await self.push_frame(LLMFullResponseEndFrame())
         self._current_assistant_response = None
         self._current_audio_response = None
         self._boson_response_start_frame_active = False
+        self._boson_tts_started = False
 
     async def _mark_api_session_ready(self):
         self._api_session_ready = True
@@ -1010,6 +1012,9 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         if self._is_stale_response_event(evt):
             return
         await super()._handle_evt_audio_delta(evt)
+        # Pipecat sends TTSStartedFrame when it opens _current_audio_response; truncation clears that later
+        if self._current_audio_response is not None:
+            self._boson_tts_started = True
 
     async def _handle_evt_text_delta(self, evt):
         if self._is_stale_response_event(evt):

@@ -34,6 +34,8 @@ from pipecat.frames.frames import (
     LLMTextFrame,
     SpeechControlParamsFrame,
     TranscriptionFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
     TTSTextFrame,
     UserStartedSpeakingFrame,
 )
@@ -915,6 +917,98 @@ async def test_server_vad_speech_started_keeps_response_active_until_server_done
     await service._handle_evt_text_delta(SimpleNamespace(response_id="resp_a", delta="still valid"))
 
     assert any(isinstance(frame, LLMTextFrame) and frame.text == "still valid" for frame in service.pushed)
+
+
+_SPOKEN_REPLY_FRAMES = ["LLMFullResponseStartFrame", "TTSStartedFrame", "TTSStoppedFrame", "LLMFullResponseEndFrame"]
+
+
+def reply_bracket_frames(service):
+    bracket = (LLMFullResponseStartFrame, TTSStartedFrame, TTSStoppedFrame, LLMFullResponseEndFrame)
+    return [type(frame).__name__ for frame in service.pushed if isinstance(frame, bracket)]
+
+
+async def start_spoken_reply(service, response_id: str):
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    await service._create_response()
+    service._handle_evt_response_created(make_response_created(response_id, service.sent[-1]["event_id"]))
+    await service._handle_evt_audio_delta(
+        SimpleNamespace(response_id=response_id, item_id=f"item_{response_id}", content_index=0, delta="AAAA")
+    )
+
+
+@pytest.mark.asyncio
+async def test_interruption_stops_reply_audio_with_tts_stopped_frame():
+    service = CapturingBosonRealtimeLLMService()
+    await start_spoken_reply(service, "resp_a")
+
+    await service._handle_interruption()
+    # The cancelled reply's late response.done is stale and must not close it again.
+    await service._handle_evt_response_done(make_response_done("resp_a", status="cancelled"))
+    await start_spoken_reply(service, "resp_b")
+    await service._handle_evt_response_done(make_response_done("resp_b"))
+
+    assert reply_bracket_frames(service) == _SPOKEN_REPLY_FRAMES * 2
+
+
+@pytest.mark.asyncio
+async def test_server_vad_barge_in_stops_reply_audio_when_boson_cancels_it():
+    service = CapturingBosonRealtimeLLMService()
+
+    async def broadcast(*_args):
+        return None
+
+    service.broadcast_frame = broadcast
+    service.broadcast_interruption = broadcast
+    await start_spoken_reply(service, "resp_a")
+
+    await service._handle_evt_speech_started(SimpleNamespace())
+    await service._handle_evt_response_done(make_response_done("resp_a", status="cancelled"))
+
+    assert reply_bracket_frames(service) == _SPOKEN_REPLY_FRAMES
+
+
+@pytest.mark.asyncio
+async def test_completed_spoken_reply_ends_with_one_tts_stopped_frame():
+    service = CapturingBosonRealtimeLLMService()
+    await start_spoken_reply(service, "resp_a")
+    await service._handle_evt_response_done(make_response_done("resp_a"))
+
+    # A later reply with no audio must not get a TTSStoppedFrame left over from this one.
+    await service._create_response()
+    service._handle_evt_response_created(make_response_created("resp_b", service.sent[-1]["event_id"]))
+    await service._handle_evt_response_done(make_response_done("resp_b"))
+
+    assert reply_bracket_frames(service) == [
+        *_SPOKEN_REPLY_FRAMES,
+        "LLMFullResponseStartFrame",
+        "LLMFullResponseEndFrame",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_barge_in_stops_reply_audio_that_started_before_any_response_start_frame():
+    # A server-started reply whose audio arrives before its assistant item: no start frame is open.
+    service = CapturingBosonRealtimeLLMService()
+
+    async def broadcast(*_args):
+        return None
+
+    service.broadcast_frame = broadcast
+    service.broadcast_interruption = broadcast
+    service._handle_evt_response_created(make_response_created("resp_server", None))
+    await service._handle_evt_audio_delta(
+        SimpleNamespace(response_id="resp_server", item_id="item_server", content_index=0, delta="AAAA")
+    )
+
+    await service._handle_evt_speech_started(SimpleNamespace())
+    await service._handle_evt_response_done(make_response_done("resp_server", status="cancelled"))
+
+    assert [name for name in reply_bracket_frames(service) if name.startswith("TTS")] == [
+        "TTSStartedFrame",
+        "TTSStoppedFrame",
+    ]
+    assert service._boson_tts_started is False
 
 
 @pytest.mark.asyncio
