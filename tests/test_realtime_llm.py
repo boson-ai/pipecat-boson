@@ -553,6 +553,25 @@ async def test_completed_transcription_dedup_cache_is_bounded():
     assert "audio_item_0" not in service._boson_completed_transcription_item_ids
 
 
+def test_every_server_event_handler_is_defined_by_the_service():
+    # Dispatch looks these names up only when the event arrives, and a renamed override
+    # would silently fall back to Pipecat's method of the same name.
+    inherited = {"_handle_evt_input_audio_transcription_delta", "_handle_conversation_item_retrieved"}
+    names = set(realtime_llm._BOSON_SERVER_EVENT_HANDLERS.values())
+
+    assert sorted(name for name in names - inherited if name not in vars(BosonRealtimeLLMService)) == []
+    assert inherited <= names
+    assert sorted(name for name in inherited if not callable(getattr(BosonRealtimeLLMService, name, None))) == []
+
+
+def test_no_server_event_type_is_in_two_dispatch_tables():
+    # Dispatch checks the handler table first, so a second listing never takes effect.
+    handled = set(realtime_llm._BOSON_SERVER_EVENT_HANDLERS)
+    assert not handled & realtime_llm._BOSON_IGNORED_SERVER_EVENT_TYPES
+    assert not handled & realtime_llm._BOSON_TERMINAL_SESSION_EVENT_TYPES
+    assert not realtime_llm._BOSON_IGNORED_SERVER_EVENT_TYPES & realtime_llm._BOSON_TERMINAL_SESSION_EVENT_TYPES
+
+
 @pytest.mark.asyncio
 async def test_input_audio_transcription_failed_logs_warning_and_continues(monkeypatch):
     service = CapturingBosonRealtimeLLMService()
