@@ -9,7 +9,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
-- Log a Boson Realtime event type the service does not handle as a warning, once per type, instead of at debug level on every event, so a new server event shows up at the usual INFO level. The service now also ignores `response.latency.completed`, which the server can send with per-turn latency figures.
+- Log a Boson Realtime event type the service does not handle as a warning the first time it arrives, and at debug level after that, so a new server event shows up at the usual INFO level. Previously every one was logged only at debug level. The service now also ignores `response.latency.completed`, which the server can send with per-turn latency figures.
 
 ### Fixed
 

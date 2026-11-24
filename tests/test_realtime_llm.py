@@ -593,10 +593,12 @@ async def test_known_unused_events_are_ignored_without_warning(monkeypatch, even
 
 
 @pytest.mark.asyncio
-async def test_unsupported_event_type_warns_once_per_type(monkeypatch):
+async def test_unsupported_event_type_warns_once_per_type_then_logs_debug(monkeypatch):
     service = CapturingBosonRealtimeLLMService()
     warnings = []
+    debug_lines = []
     monkeypatch.setattr(realtime_llm.logger, "warning", warnings.append)
+    monkeypatch.setattr(realtime_llm.logger, "debug", debug_lines.append)
 
     for event_type in ("response.future_event", "response.future_event", "response.other_event"):
         assert await service._dispatch_boson_server_event({"type": event_type}) is True
@@ -605,6 +607,7 @@ async def test_unsupported_event_type_warns_once_per_type(monkeypatch):
         "Ignoring unsupported Boson realtime event type: response.future_event",
         "Ignoring unsupported Boson realtime event type: response.other_event",
     ]
+    assert debug_lines == ["Ignoring unsupported Boson realtime event type: response.future_event"]
 
 
 @pytest.mark.asyncio
