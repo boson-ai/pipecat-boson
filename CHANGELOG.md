@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+- Log a Boson Realtime event type the service does not handle as a warning the first time it arrives, and at debug level after that, so a new server event shows up at the usual INFO level. Previously every one was logged only at debug level. The service now also ignores `response.latency.completed`, which the server can send with per-turn latency figures.
+
 ### Fixed
 
 - Reply to typed text and `LLMMessagesAppendFrame` in a standard pipeline (#20). The user aggregator previously consumed append frames before the service saw them, so playground typed messages and mid-call appends got no Higgs reply. Place `BosonMessagesAppendRelay` immediately before the user aggregator so `run_llm` reaches the service; without it, a context push with a new typed user message logs a one-time warning and does not invent a reply.
@@ -16,6 +20,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - In manual turn-detection mode, an interruption no longer stops the session from responding at some pre-roll lengths, such as a VAD `start_secs` of 0.15, 0.35 or 0.6. Pipecat can size the replayed speech onset one byte short of a whole sample, and Boson rejected it.
 - Stop logging "Ignoring unsupported Boson realtime event type" for every `conversation.item.done`. The Boson Realtime server now sends one after every `conversation.item.added`; the service ignores it, as it does `response.output_item.done`.
 - An error Boson recovers from no longer ends the session. Previously almost any error, such as a rate limit, a failed LLM or TTS call during a response, or a rejected request, stopped the service from reading Boson's events, so the bot went quiet while Boson kept the session open. The service now stops only on the errors Boson ends the session on: `Session terminated due to …` and a billing refusal (`insufficient_quota`). Other errors still push a non-fatal `ErrorFrame`; a failed response, such as a rate limit or a failed LLM or TTS call, is reported once, when it ends.
+- Log when Boson closes the websocket normally. The Boson Realtime server ends a session with close code 1000, including after an idle timeout or the maximum session length, and the service logged nothing for it: the websockets library ends the receive loop quietly on a normal close, so the branch meant to log it never ran. Disconnecting the service itself still logs nothing.
 - Push `TTSStoppedFrame` when the caller interrupts a spoken reply. Barge-in cleared the service's record of the reply's audio before closing the reply, so only `LLMFullResponseEndFrame` was pushed: RTVI clients got `bot-tts-started` with no `bot-tts-stopped`. This happened both when Pipecat sent an interruption and when Boson's server VAD detected the caller and cancelled the reply.
 
 ## [0.1.4] - 2026-10-22

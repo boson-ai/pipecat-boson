@@ -142,6 +142,7 @@ _BOSON_IGNORED_SERVER_EVENT_TYPES = {
     "response.output_audio_transcript.done",
     "rate_limits.updated",
     "latency_testing",
+    "response.latency.completed",
     "conversation.context.summarized",
     "state.changed",
 }
@@ -301,6 +302,7 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         self._boson_server_call_ids: deque[str] = deque(maxlen=_BOSON_TRANSCRIPTION_DEDUP_CACHE_SIZE)
         self._boson_terminal_session_event_type: str | None = None
         self._boson_response_start_frame_active = False
+        self._boson_warned_event_types: set[str | None] = set()
         self._boson_tts_started = False
 
         if session_tools is not None:
@@ -781,8 +783,9 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
                         return
                 except Exception as exc:  # noqa: BLE001 - Keep the receive loop from dying on one bad event.
                     await self.push_error(error_msg=f"Error handling Boson realtime event: {exc}", exception=exc)
-        except ConnectionClosedOK:
-            logger.info("Boson realtime API websocket closed normally")
+            # websockets ends the loop quietly on a normal close.
+            if not self._disconnecting:
+                logger.info("Boson realtime API websocket closed normally")
         except ConnectionClosed as exc:
             if self._boson_terminal_session_event_type:
                 logger.info(
@@ -813,8 +816,12 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             await self._call_event_handler("on_session_terminated", event_type, evt)
         elif event_type in _BOSON_IGNORED_SERVER_EVENT_TYPES:
             return True
-        else:
+        elif event_type in self._boson_warned_event_types:
             logger.debug(f"Ignoring unsupported Boson realtime event type: {event_type}")
+        else:
+            # Once per type: a new Boson event should show at INFO without flooding the log.
+            self._boson_warned_event_types.add(event_type)
+            logger.warning(f"Ignoring unsupported Boson realtime event type: {event_type}")
         return True
 
     async def _handle_evt_session_created(self, evt):
