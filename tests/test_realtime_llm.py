@@ -47,6 +47,8 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.openai.realtime import events
 from pipecat.tests.utils import run_test
 from pipecat.utils import deprecation as pipecat_deprecation
+from websockets.asyncio.client import connect as websocket_connect
+from websockets.asyncio.server import serve as websocket_serve
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 import pipecat_boson.realtime.llm as realtime_llm
@@ -1335,6 +1337,41 @@ async def test_receive_task_terminal_session_events_suppress_unexpected_close_er
     assert service._websocket is None
     assert service._api_session_ready is False
     assert service.metrics_stopped is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_code", [1000, 1001])
+async def test_receive_task_logs_a_normal_close_from_a_real_websocket(monkeypatch, close_code: int):
+    # A real socket: websockets ends the iteration on a normal close instead of raising.
+    async def close_session(websocket):
+        await websocket.close(code=close_code)
+
+    service = CapturingErrorBosonRealtimeLLMService()
+    infos = []
+    monkeypatch.setattr(realtime_llm.logger, "info", infos.append)
+
+    async with websocket_serve(close_session, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        service._websocket = await websocket_connect(f"ws://127.0.0.1:{port}")
+        await service._receive_task_handler()
+
+    assert infos == ["Boson realtime API websocket closed normally"]
+    assert service.errors == []
+    assert service._websocket is None
+
+
+@pytest.mark.asyncio
+async def test_receive_task_does_not_log_a_close_it_started(monkeypatch):
+    service = CapturingErrorBosonRealtimeLLMService()
+    service._websocket = ExhaustedWebSocket()
+    service._disconnecting = True
+    infos = []
+    monkeypatch.setattr(realtime_llm.logger, "info", infos.append)
+
+    await service._receive_task_handler()
+
+    assert infos == []
+    assert service.errors == []
 
 
 # Error events copied from Boson's server: it keeps the session after each of these.

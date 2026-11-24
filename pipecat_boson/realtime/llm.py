@@ -780,8 +780,9 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
                         return
                 except Exception as exc:  # noqa: BLE001 - Keep the receive loop from dying on one bad event.
                     await self.push_error(error_msg=f"Error handling Boson realtime event: {exc}", exception=exc)
-        except ConnectionClosedOK:
-            logger.info("Boson realtime API websocket closed normally")
+            # websockets ends the loop quietly on a normal close.
+            if not self._disconnecting:
+                logger.info("Boson realtime API websocket closed normally")
         except ConnectionClosed as exc:
             if self._boson_terminal_session_event_type:
                 logger.info(
