@@ -81,9 +81,10 @@ first merged into Pipecat's stored `session_properties` (`_merge_model`), becaus
 Pipecat's `apply_update` replaces that field wholesale. Then
 `_sync_boson_settings_from_pipecat` mirrors only the fields the update set into
 the `_boson_*` fields, and a fresh `session.update` is sent; an update that
-changes nothing sends nothing. `_current_model` / `_current_instructions`
-/ `_current_temperature` / `_current_tools` resolve "use the runtime override if
-given, else the constructed default."
+changes nothing sends nothing. A turn-detection change refused mid-session (see
+below) still sends one, carrying the current turn detection. `_current_model` /
+`_current_instructions` / `_current_temperature` / `_current_tools` resolve "use
+the runtime override if given, else the constructed default."
 
 ### Server events and response lifecycle
 
@@ -101,8 +102,10 @@ response ids (`_boson_pending_response_client_event_ids`,
 `_boson_active_response_ids`, `_boson_cancelled_response_ids`, and their
 client-event-id counterparts). `_is_stale_response_event` /
 `_is_stale_response_done` gate audio/text/transcript deltas so stale output is
-dropped. When touching response handling, keep these sets consistent — they are
-cleared together in `_mark_websocket_disconnected` and `_cancel_active_response`.
+dropped. When touching response handling, keep these sets consistent:
+`_mark_websocket_disconnected` and the `response_not_active` error branch clear all
+four, and `_mark_active_response_cancelled` (behind `_cancel_active_response` and
+`_handle_interruption`) moves the pending and active ids into the cancelled sets.
 
 Terminal session events (`session.idle_timeout`, `session.max_duration_reached`)
 set `_boson_terminal_session_event_type` so a subsequent websocket close is

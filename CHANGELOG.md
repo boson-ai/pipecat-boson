@@ -20,6 +20,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - In manual turn-detection mode, an interruption no longer stops the session from responding at some pre-roll lengths, such as a VAD `start_secs` of 0.15, 0.35 or 0.6. Pipecat can size the replayed speech onset one byte short of a whole sample, and Boson rejected it.
 - Stop logging "Ignoring unsupported Boson realtime event type" for every `conversation.item.done`. The Boson Realtime server now sends one after every `conversation.item.added`; the service ignores it, as it does `response.output_item.done`.
 - An error Boson recovers from no longer ends the session. Previously almost any error, such as a rate limit, a failed LLM or TTS call during a response, or a rejected request, stopped the service from reading Boson's events, so the bot went quiet while Boson kept the session open. The service now stops only on the errors Boson ends the session on: `Session terminated due to …` and a billing refusal (`insufficient_quota`). Other errors still push a non-fatal `ErrorFrame`; a failed response, such as a rate limit or a failed LLM or TTS call, is reported once, when it ends.
+- Log when Boson closes the websocket normally. The Boson Realtime server ends a session with close code 1000, including after an idle timeout or the maximum session length, and the service logged nothing for it: the websockets library ends the receive loop quietly on a normal close, so the branch meant to log it never ran. Disconnecting the service itself still logs nothing.
 
 ## [0.1.4] - 2026-10-22
 

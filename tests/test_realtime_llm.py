@@ -47,6 +47,8 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.openai.realtime import events
 from pipecat.tests.utils import run_test
 from pipecat.utils import deprecation as pipecat_deprecation
+from websockets.asyncio.client import connect as websocket_connect
+from websockets.asyncio.server import serve as websocket_serve
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 import pipecat_boson.realtime.llm as realtime_llm
@@ -549,6 +551,25 @@ async def test_completed_transcription_dedup_cache_is_bounded():
 
     assert len(service._boson_completed_transcription_item_ids) == realtime_llm._BOSON_TRANSCRIPTION_DEDUP_CACHE_SIZE
     assert "audio_item_0" not in service._boson_completed_transcription_item_ids
+
+
+def test_every_server_event_handler_is_defined_by_the_service():
+    # Dispatch looks these names up only when the event arrives, and a renamed override
+    # would silently fall back to Pipecat's method of the same name.
+    inherited = {"_handle_evt_input_audio_transcription_delta", "_handle_conversation_item_retrieved"}
+    names = set(realtime_llm._BOSON_SERVER_EVENT_HANDLERS.values())
+
+    assert sorted(name for name in names - inherited if name not in vars(BosonRealtimeLLMService)) == []
+    assert inherited <= names
+    assert sorted(name for name in inherited if not callable(getattr(BosonRealtimeLLMService, name, None))) == []
+
+
+def test_no_server_event_type_is_in_two_dispatch_tables():
+    # Dispatch checks the handler table first, so a second listing never takes effect.
+    handled = set(realtime_llm._BOSON_SERVER_EVENT_HANDLERS)
+    assert not handled & realtime_llm._BOSON_IGNORED_SERVER_EVENT_TYPES
+    assert not handled & realtime_llm._BOSON_TERMINAL_SESSION_EVENT_TYPES
+    assert not realtime_llm._BOSON_IGNORED_SERVER_EVENT_TYPES & realtime_llm._BOSON_TERMINAL_SESSION_EVENT_TYPES
 
 
 @pytest.mark.asyncio
@@ -1339,6 +1360,41 @@ async def test_receive_task_terminal_session_events_suppress_unexpected_close_er
     assert service._websocket is None
     assert service._api_session_ready is False
     assert service.metrics_stopped is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_code", [1000, 1001])
+async def test_receive_task_logs_a_normal_close_from_a_real_websocket(monkeypatch, close_code: int):
+    # A real socket: websockets ends the iteration on a normal close instead of raising.
+    async def close_session(websocket):
+        await websocket.close(code=close_code)
+
+    service = CapturingErrorBosonRealtimeLLMService()
+    infos = []
+    monkeypatch.setattr(realtime_llm.logger, "info", infos.append)
+
+    async with websocket_serve(close_session, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        service._websocket = await websocket_connect(f"ws://127.0.0.1:{port}")
+        await service._receive_task_handler()
+
+    assert infos == ["Boson realtime API websocket closed normally"]
+    assert service.errors == []
+    assert service._websocket is None
+
+
+@pytest.mark.asyncio
+async def test_receive_task_does_not_log_a_close_it_started(monkeypatch):
+    service = CapturingErrorBosonRealtimeLLMService()
+    service._websocket = ExhaustedWebSocket()
+    service._disconnecting = True
+    infos = []
+    monkeypatch.setattr(realtime_llm.logger, "info", infos.append)
+
+    await service._receive_task_handler()
+
+    assert infos == []
+    assert service.errors == []
 
 
 # Error events copied from Boson's server: it keeps the session after each of these.
