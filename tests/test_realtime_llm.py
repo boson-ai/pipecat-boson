@@ -246,6 +246,82 @@ async def test_send_client_event_maps_pipecat_response_output_modalities():
 
 
 @pytest.mark.asyncio
+async def test_send_image_adds_a_user_message_with_one_image_part():
+    service = CapturingBosonRealtimeLLMService()
+    image = "data:image/png;base64,aGVsbG8="
+
+    item_id = await service.send_image(image)
+
+    assert service.sent == [
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "id": item_id,
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_image", "image_url": image}],
+            },
+        }
+    ]
+    # The image asks for no response.
+    assert not service._boson_pending_response_client_event_ids
+
+    assert await service.send_image(image, item_id="img_1") == "img_1"
+    assert service.sent[-1]["item"]["id"] == "img_1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_url", ["", "https://example.com/cat.png", "data:text/plain;base64,aGVsbG8=", None])
+async def test_send_image_takes_only_an_image_data_uri(image_url):
+    service = CapturingBosonRealtimeLLMService()
+
+    with pytest.raises(ValueError, match="data URI of an image"):
+        await service.send_image(image_url)
+
+    assert service.sent == []
+
+
+@pytest.mark.asyncio
+async def test_an_image_the_model_cannot_take_is_an_error_frame_and_the_session_continues():
+    service = CapturingBosonRealtimeLLMService()
+    await service.send_image("data:image/png;base64,aGVsbG8=", item_id="img_1")
+
+    should_continue = await service._dispatch_boson_server_event(
+        make_error_event(
+            "invalid_request_error",
+            "Image input is not supported by this session's model.",
+            code="image_input_not_supported",
+        )
+    )
+
+    assert should_continue is True
+    assert len(service.errors) == 1
+    assert "Image input is not supported" in service.errors[0]
+
+
+@pytest.mark.asyncio
+async def test_an_added_image_is_reported_by_its_item_id():
+    service = CapturingBosonRealtimeLLMService()
+    created: list[str] = []
+
+    @service.event_handler("on_conversation_item_created")
+    async def on_conversation_item_created(_service, item_id, _item):
+        created.append(item_id)
+
+    item_id = await service.send_image("data:image/png;base64,aGVsbG8=")
+    await service._dispatch_boson_server_event(
+        {
+            "type": "conversation.item.added",
+            "item": {"id": item_id, "type": "message", "role": "user", "content": [{"type": "input_image"}]},
+        }
+    )
+    await asyncio.sleep(0)
+
+    assert created == [item_id]
+    assert service.pushed == []
+
+
+@pytest.mark.asyncio
 async def test_send_tool_result_does_not_double_encode_serialized_json():
     service = CapturingBosonRealtimeLLMService()
     result = json.dumps(

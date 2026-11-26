@@ -130,6 +130,9 @@ logged as expected rather than surfaced as an error frame.
   one, so only its message tells them apart. `_handle_error_event` stops the receive
   loop only on those two, logs a warning for the `_BOSON_NONFATAL_*` errors, and
   pushes a non-fatal `ErrorFrame` for the rest.
+- An image goes in as a `user` message item with one `input_image` part whose
+  `image_url` is a data URI (`send_image`). It starts no response. A model without
+  image input answers with a recoverable `error` (`image_input_not_supported`).
 - Boson accepts only `user` and `assistant` message items from a client and rejects
   `system` with a 400. Pipecat 1.13 sends a tool's progress updates as system items,
   so `_handle_function_call_result` drops them

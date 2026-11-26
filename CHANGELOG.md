@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- `BosonRealtimeLLMService.send_image` adds an image to the conversation as a user message, from a data URI. The image starts no response; the model sees it with the user's next turn. A model that takes no image input rejects it with a non-fatal `ErrorFrame`, and the session continues.
+
 ## [0.1.5] - 2026-11-25
 
 ### Changed
