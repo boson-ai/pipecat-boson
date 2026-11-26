@@ -370,6 +370,47 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         payload = _normalize_response_create_payload(payload)
         await self._ws_send(payload)
 
+    async def send_image(self, image_url: str, *, item_id: str | None = None) -> str:
+        """Add an image to the conversation as a user message.
+
+        The image starts no response. The model sees it with the user's next
+        turn, or with the next response the application asks for.
+
+        ``on_conversation_item_created`` fires with the returned id once Boson
+        has added the image. A model that takes no image input rejects it: the
+        rejection reaches the pipeline as a non-fatal ``ErrorFrame`` and the
+        session continues. Like any client event, the image is dropped while
+        the service is not connected.
+
+        Args:
+            image_url: The image as a data URI, such as
+                ``data:image/png;base64,...``.
+            item_id: The id of the conversation item. One is generated when
+                omitted.
+
+        Returns:
+            The id of the conversation item.
+
+        Raises:
+            ValueError: If ``image_url`` is not a data URI of an image.
+        """
+
+        if not isinstance(image_url, str) or not image_url.startswith("data:image/"):
+            raise ValueError("image_url must be a data URI of an image, such as data:image/png;base64,...")
+        item_id = item_id or f"item_{uuid.uuid4().hex}"
+        await self.send_client_event(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_image", "image_url": image_url}],
+                },
+            }
+        )
+        return item_id
+
     async def _handle_function_call_result(self, frame: FunctionCallResultFrame) -> None:
         """Send a tool's result as pipecat-ai 1.13 produces it, dropping progress updates Boson can't take."""
 

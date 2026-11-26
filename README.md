@@ -321,6 +321,28 @@ The service supports exactly one session output modality: `["audio"]` or
 `["text"]`. Mixed output modalities and per-response modality overrides are not
 supported.
 
+## Send an image
+
+Call `send_image` to add an image to the conversation as a user message. Pass
+the image as a data URI:
+
+```python
+import base64
+
+
+async def show_image(llm, png_bytes: bytes) -> str:
+    data = base64.b64encode(png_bytes).decode("ascii")
+    return await llm.send_image(f"data:image/png;base64,{data}")
+```
+
+The image starts no response. The model sees it with the user's next turn.
+`send_image` returns the id of the conversation item, and
+`on_conversation_item_created` fires with that id once the image has been
+added.
+
+A model that takes no image input rejects the image. The rejection reaches
+the pipeline as a non-fatal `ErrorFrame`, and the session continues.
+
 ## Handle session events
 
 Use Pipecat service event handlers to observe the Higgs Realtime session
